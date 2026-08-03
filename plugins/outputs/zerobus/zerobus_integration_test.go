@@ -10,7 +10,6 @@ import (
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/metric"
-	"github.com/influxdata/telegraf/testutil"
 )
 
 func TestConnectAndWriteIntegration(t *testing.T) {
@@ -53,7 +52,6 @@ func TestConnectAndWriteIntegration(t *testing.T) {
 		TimestampColumn:   timestampColumn,
 		MeasurementColumn: os.Getenv("ZEROBUS_MEASUREMENT_COLUMN"),
 		MaxBatchRecords:   defaultMaxBatchRecords,
-		Log:               testutil.Logger{},
 	}
 	require.NoError(t, plugin.Init())
 	require.NoError(t, plugin.Connect())

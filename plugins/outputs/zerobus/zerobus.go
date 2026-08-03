@@ -28,6 +28,7 @@ var sampleConfig string
 const (
 	defaultMaxBatchRecords = 100_000
 	defaultMaxPayloadBytes = 10*1024*1024 - 64*1024
+	defaultConnectTimeout  = 30 * time.Second
 	batchEnvelopeReserve   = 1024
 	schemaModeCanonical    = "canonical"
 	schemaModeUnityCatalog = "unity_catalog"
@@ -46,6 +47,7 @@ type Zerobus struct {
 	MeasurementColumn  string          `toml:"measurement_column"`
 	SchemaFetchTimeout config.Duration `toml:"schema_fetch_timeout"`
 	SchemaCacheTTL     config.Duration `toml:"schema_cache_ttl"`
+	ConnectTimeout     config.Duration `toml:"connect_timeout"`
 
 	MaxInflight             int             `toml:"max_inflight"`
 	MaxBufferedPayloadBytes config.Size     `toml:"max_buffered_payload_bytes"`
@@ -56,8 +58,6 @@ type Zerobus struct {
 	RecoveryBackoff         config.Duration `toml:"recovery_backoff"`
 	LackOfAckTimeout        config.Duration `toml:"lack_of_ack_timeout"`
 	FlushTimeout            config.Duration `toml:"flush_timeout"`
-
-	Log telegraf.Logger `toml:"-"`
 
 	sdk       sdkClient
 	stream    ingestStream
@@ -145,7 +145,10 @@ type unityCatalogStreamAdapter struct {
 	*sdkzerobus.DynamicProtoStream
 }
 
-func (s *unityCatalogStreamAdapter) IngestRecordsOffset(records [][]byte, encoded bool) (int64, error) {
+func (s *unityCatalogStreamAdapter) IngestRecordsOffset(
+	records [][]byte,
+	encoded bool,
+) (int64, error) {
 	if encoded {
 		return s.DynamicProtoStream.Stream.IngestRecordsOffset(records)
 	}
@@ -221,6 +224,12 @@ func (z *Zerobus) Init() error {
 	if z.SchemaFetchTimeout < 0 {
 		return errors.New(`option "schema_fetch_timeout" cannot be negative`)
 	}
+	if z.ConnectTimeout < 0 {
+		return errors.New(`option "connect_timeout" cannot be negative`)
+	}
+	if z.ConnectTimeout == 0 {
+		z.ConnectTimeout = config.Duration(defaultConnectTimeout)
+	}
 	for _, option := range []struct {
 		name  string
 		value config.Duration
@@ -257,10 +266,11 @@ func (z *Zerobus) Connect() error {
 	}
 	defer secret.Destroy()
 
-	sdkOptions := make([]sdkzerobus.Option, 0, 1)
-	if z.ApplicationName != "" {
-		sdkOptions = append(sdkOptions, sdkzerobus.WithApplicationName(z.ApplicationName))
+	applicationName := internal.ProductToken()
+	if name := strings.TrimSpace(z.ApplicationName); name != "" {
+		applicationName += " " + name
 	}
+	sdkOptions := []sdkzerobus.Option{sdkzerobus.WithApplicationName(applicationName)}
 	if z.SchemaMode == schemaModeUnityCatalog {
 		if z.SchemaFetchTimeout > 0 {
 			sdkOptions = append(
@@ -281,9 +291,15 @@ func (z *Zerobus) Connect() error {
 	}
 
 	z.sdk = sdk
-	if err := z.openStream(secret.String()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(z.ConnectTimeout))
+	defer cancel()
+	if err := z.openStream(ctx, secret.String()); err != nil {
 		z.sdk = nil
-		return errors.Join(fmt.Errorf("creating Zerobus stream failed: %w", err), sdk.Close())
+		startupErr := &internal.StartupError{
+			Err:   fmt.Errorf("creating Zerobus stream failed: %w", err),
+			Retry: sdkzerobus.Retryable(err),
+		}
+		return errors.Join(startupErr, sdk.Close())
 	}
 
 	return nil
@@ -350,7 +366,7 @@ func (z *Zerobus) Close() error {
 	return errors.Join(streamErr, sdkErr)
 }
 
-func (z *Zerobus) openStream(clientSecret string) error {
+func (z *Zerobus) openStream(ctx context.Context, clientSecret string) error {
 	options := z.streamOptions()
 	var (
 		stream ingestStream
@@ -358,7 +374,7 @@ func (z *Zerobus) openStream(clientSecret string) error {
 	)
 	if z.SchemaMode == schemaModeUnityCatalog {
 		stream, err = z.sdk.CreateUnityCatalogStream(
-			context.Background(),
+			ctx,
 			z.TableName,
 			z.ClientID,
 			clientSecret,
@@ -371,7 +387,7 @@ func (z *Zerobus) openStream(clientSecret string) error {
 		}
 		options = append([]sdkzerobus.StreamOption{sdkzerobus.WithProto(descriptor)}, options...)
 		stream, err = z.sdk.CreateStream(
-			context.Background(),
+			ctx,
 			z.TableName,
 			z.ClientID,
 			clientSecret,
@@ -418,7 +434,9 @@ func (z *Zerobus) openStreamFromSecret() error {
 		return fmt.Errorf("resolving client secret for stream recovery failed: %w", err)
 	}
 	defer secret.Destroy()
-	if err := z.openStream(secret.String()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(z.ConnectTimeout))
+	defer cancel()
+	if err := z.openStream(ctx, secret.String()); err != nil {
 		return z.writeError("recreating stream", err)
 	}
 	return nil
@@ -529,12 +547,15 @@ func recordsHavePrefix(records, prefix [][]byte) bool {
 }
 
 func (z *Zerobus) streamOptions() []sdkzerobus.StreamOption {
-	options := make([]sdkzerobus.StreamOption, 0, 9)
+	options := []sdkzerobus.StreamOption{sdkzerobus.WithWaitForReady()}
 	if z.MaxInflight > 0 {
 		options = append(options, sdkzerobus.WithMaxInflight(z.MaxInflight))
 	}
 	if z.MaxBufferedPayloadBytes > 0 {
-		options = append(options, sdkzerobus.WithMaxBufferedPayloadBytes(int64(z.MaxBufferedPayloadBytes)))
+		options = append(
+			options,
+			sdkzerobus.WithMaxBufferedPayloadBytes(int64(z.MaxBufferedPayloadBytes)),
+		)
 	}
 	if z.MaxBatchRecords > 0 {
 		options = append(options, sdkzerobus.WithMaxBatchRecords(z.MaxBatchRecords))
@@ -562,9 +583,6 @@ func (z *Zerobus) streamOptions() []sdkzerobus.StreamOption {
 
 func (z *Zerobus) writeError(operation string, err error) error {
 	retryable := sdkzerobus.Retryable(err)
-	if !retryable {
-		z.Log.Errorf("Zerobus %s failed with a non-retryable error: %v", operation, err)
-	}
 	return fmt.Errorf("Zerobus %s failed (retryable=%t): %w", operation, retryable, err)
 }
 
@@ -576,9 +594,9 @@ func messageDescriptor() ([]byte, error) {
 func init() {
 	outputs.Add("zerobus", func() telegraf.Output {
 		return &Zerobus{
-			ApplicationName: "telegraf",
 			SchemaMode:      schemaModeCanonical,
 			TimestampColumn: "timestamp",
+			ConnectTimeout:  config.Duration(defaultConnectTimeout),
 			MaxBatchRecords: defaultMaxBatchRecords,
 		}
 	})

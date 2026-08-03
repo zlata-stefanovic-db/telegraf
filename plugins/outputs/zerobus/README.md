@@ -56,8 +56,11 @@ See the [secret store documentation][SECRETSTORE] for details.
   client_id = ""
   client_secret = ""
 
-  ## Identifier appended to the Zerobus SDK user-agent.
-  # application_name = "telegraf"
+  ## Optional identifier appended to Telegraf's product token.
+  # application_name = ""
+
+  ## Stream startup timeout.
+  # connect_timeout = "30s"
 
   ## Schema-fetch timeout; zero uses the SDK default.
   # schema_fetch_timeout = "0s"
@@ -94,10 +97,9 @@ See the [secret store documentation][SECRETSTORE] for details.
 ```
 
 The service principal identified by `client_id` must have permission to write
-to the configured table. Canonical streams open asynchronously, so network,
-authentication, and schema errors can first appear during `Write`. Unity
-Catalog mode fetches the table schema during `Connect`; stream-open errors can
-still surface during `Write`.
+to the configured table. `Connect` waits for stream startup for up to
+`connect_timeout`, returning network, authentication, and schema errors before
+metrics are written.
 
 ## Schema modes
 
@@ -184,8 +186,8 @@ the complete batch before admitting it, splits it into requests that satisfy
 means the full Telegraf batch was acknowledged. It never waits per record.
 
 Admission and acknowledgment failures are returned to Telegraf, which keeps the
-original metrics for retry. Non-retryable Zerobus errors are identified in the
-error and plugin log, but the plugin does not silently discard metrics.
+original metrics for retry. Errors include their retryability, and the plugin
+does not silently discard metrics.
 
 The plugin retains admission progress after a failed `Write`. On retry it first
 confirms already admitted requests instead of admitting them again. If SDK

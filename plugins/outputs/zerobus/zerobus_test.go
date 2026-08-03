@@ -29,9 +29,10 @@ func TestDefaults(t *testing.T) {
 
 	plugin, ok := creator().(*Zerobus)
 	require.True(t, ok)
-	require.Equal(t, "telegraf", plugin.ApplicationName)
+	require.Empty(t, plugin.ApplicationName)
 	require.Equal(t, schemaModeCanonical, plugin.SchemaMode)
 	require.Equal(t, "timestamp", plugin.TimestampColumn)
+	require.Equal(t, config.Duration(defaultConnectTimeout), plugin.ConnectTimeout)
 	require.Equal(t, defaultMaxBatchRecords, plugin.MaxBatchRecords)
 	require.NotEmpty(t, plugin.SampleConfig())
 }
@@ -138,6 +139,11 @@ func TestInitRejectsInvalidTuning(t *testing.T) {
 			name:   "negative schema fetch timeout",
 			mutate: func(z *Zerobus) { z.SchemaFetchTimeout = -1 },
 			option: "schema_fetch_timeout",
+		},
+		{
+			name:   "negative connect timeout",
+			mutate: func(z *Zerobus) { z.ConnectTimeout = -1 },
+			option: "connect_timeout",
 		},
 	}
 
@@ -389,7 +395,10 @@ func TestConnectPassesConfiguration(t *testing.T) {
 	require.Equal(t, plugin.TableName, sdk.tableName)
 	require.Equal(t, plugin.ClientID, sdk.clientID)
 	require.Equal(t, "secret", sdk.clientSecret)
-	require.Len(t, sdk.options, 10)
+	require.Len(t, sdk.options, 11)
+	require.Len(t, sdk.contexts, 1)
+	_, hasDeadline := sdk.contexts[0].Deadline()
+	require.True(t, hasDeadline)
 	require.Same(t, stream, plugin.stream)
 }
 
@@ -412,7 +421,7 @@ func TestConnectCreatesUnityCatalogStream(t *testing.T) {
 	require.Equal(t, 3, sdkOptionCount)
 	require.Zero(t, sdk.createCalls)
 	require.Equal(t, 1, sdk.unityCatalogCalls)
-	require.Len(t, sdk.options, 1)
+	require.Len(t, sdk.options, 2)
 	require.Same(t, stream, plugin.stream)
 }
 
@@ -427,6 +436,9 @@ func TestConnectClosesSDKWhenStreamCreationFails(t *testing.T) {
 	require.NoError(t, plugin.Init())
 	err := plugin.Connect()
 	require.ErrorIs(t, err, createErr)
+	var startupErr *internal.StartupError
+	require.ErrorAs(t, err, &startupErr)
+	require.Equal(t, sdkzerobus.Retryable(createErr), startupErr.Retry)
 	require.Equal(t, 1, sdk.closeCalls)
 }
 
@@ -446,7 +458,12 @@ func TestWriteBatchesAndFlushesOnce(t *testing.T) {
 	plugin := validPlugin()
 	plugin.stream = stream
 	metrics := []telegraf.Metric{
-		metric.New("cpu", map[string]string{"host": "a"}, map[string]interface{}{"usage": 1.5}, time.Unix(1, 2)),
+		metric.New(
+			"cpu",
+			map[string]string{"host": "a"},
+			map[string]interface{}{"usage": 1.5},
+			time.Unix(1, 2),
+		),
 		metric.New("mem", nil, map[string]interface{}{"used": uint64(7)}, time.Unix(3, 4)),
 	}
 
@@ -507,7 +524,8 @@ func TestWriteFailures(t *testing.T) {
 	flushErr := errors.New("flush failed")
 
 	t.Run("not connected", func(t *testing.T) {
-		require.ErrorIs(t, validPlugin().Write([]telegraf.Metric{testutil.TestMetric(1)}), internal.ErrNotConnected)
+		err := validPlugin().Write([]telegraf.Metric{testutil.TestMetric(1)})
+		require.ErrorIs(t, err, internal.ErrNotConnected)
 	})
 
 	t.Run("batch is split by record count", func(t *testing.T) {
@@ -515,7 +533,8 @@ func TestWriteFailures(t *testing.T) {
 		plugin := validPlugin()
 		plugin.MaxBatchRecords = 1
 		plugin.stream = stream
-		require.NoError(t, plugin.Write([]telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}))
+		input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
+		require.NoError(t, plugin.Write(input))
 		require.Equal(t, 2, stream.ingestCalls)
 		require.Equal(t, 1, stream.flushCalls)
 		require.Len(t, stream.batches, 2)
@@ -848,8 +867,8 @@ func validPlugin() *Zerobus {
 		ApplicationName: "telegraf",
 		SchemaMode:      schemaModeCanonical,
 		TimestampColumn: "timestamp",
+		ConnectTimeout:  config.Duration(defaultConnectTimeout),
 		MaxBatchRecords: defaultMaxBatchRecords,
-		Log:             testutil.Logger{},
 	}
 }
 
@@ -919,13 +938,14 @@ type fakeSDK struct {
 	clientID          string
 	clientSecret      string
 	options           []sdkzerobus.StreamOption
+	contexts          []context.Context
 	createCalls       int
 	unityCatalogCalls int
 	closeCalls        int
 }
 
 func (s *fakeSDK) CreateStream(
-	_ context.Context,
+	ctx context.Context,
 	tableName, clientID, clientSecret string,
 	options ...sdkzerobus.StreamOption,
 ) (ingestStream, error) {
@@ -934,6 +954,7 @@ func (s *fakeSDK) CreateStream(
 	s.clientID = clientID
 	s.clientSecret = clientSecret
 	s.options = options
+	s.contexts = append(s.contexts, ctx)
 	err := s.createErr
 	if len(s.createErrors) > 0 {
 		err = s.createErrors[0]
@@ -948,7 +969,7 @@ func (s *fakeSDK) CreateStream(
 }
 
 func (s *fakeSDK) CreateUnityCatalogStream(
-	_ context.Context,
+	ctx context.Context,
 	tableName, clientID, clientSecret string,
 	options ...sdkzerobus.StreamOption,
 ) (ingestStream, error) {
@@ -957,6 +978,7 @@ func (s *fakeSDK) CreateUnityCatalogStream(
 	s.clientID = clientID
 	s.clientSecret = clientSecret
 	s.options = options
+	s.contexts = append(s.contexts, ctx)
 	err := s.createErr
 	if len(s.createErrors) > 0 {
 		err = s.createErrors[0]

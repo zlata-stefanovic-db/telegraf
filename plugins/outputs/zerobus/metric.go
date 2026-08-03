@@ -26,7 +26,12 @@ func metricToProto(metric telegraf.Metric) (*TelegrafMetric, error) {
 	for _, field := range fields {
 		value, err := fieldToProto(field)
 		if err != nil {
-			return nil, fmt.Errorf("converting field %q of metric %q failed: %w", field.Key, metric.Name(), err)
+			return nil, fmt.Errorf(
+				"converting field %q of metric %q failed: %w",
+				field.Key,
+				metric.Name(),
+				err,
+			)
 		}
 		values = append(values, value)
 	}

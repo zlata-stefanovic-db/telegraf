@@ -4,18 +4,15 @@ package telegraf.zerobus.v1;
 
 option go_package = "github.com/influxdata/telegraf/plugins/outputs/zerobus";
 
-// TelegrafMetric is the wire record defined by this output plugin. Field
-// numbers correspond to the one-based column ordinals of the destination
-// Delta table.
+// TelegrafMetric maps one metric to a Delta row. Field numbers match column
+// order.
 message TelegrafMetric {
   required string measurement = 1;
   required int64 timestamp_ns = 2;
   map<string, string> tags = 3;
   repeated FieldValue fields = 4;
 
-  // FieldValue preserves the type of a Telegraf field without using oneof,
-  // which has no direct Delta table representation. Exactly one value member
-  // is set.
+  // FieldValue stores one typed field; exactly one value is set.
   message FieldValue {
     required string key = 1;
     required string type = 2;

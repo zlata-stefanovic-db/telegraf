@@ -21,9 +21,8 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// TelegrafMetric is the wire record defined by this output plugin. Field
-// numbers correspond to the one-based column ordinals of the destination
-// Delta table.
+// TelegrafMetric maps one metric to a Delta row. Field numbers match column
+// order.
 type TelegrafMetric struct {
 	state         protoimpl.MessageState       `protogen:"open.v1"`
 	Measurement   *string                      `protobuf:"bytes,1,req,name=measurement" json:"measurement,omitempty"`
@@ -92,9 +91,7 @@ func (x *TelegrafMetric) GetFields() []*TelegrafMetric_FieldValue {
 	return nil
 }
 
-// FieldValue preserves the type of a Telegraf field without using oneof,
-// which has no direct Delta table representation. Exactly one value member
-// is set.
+// FieldValue stores one typed field; exactly one value is set.
 type TelegrafMetric_FieldValue struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           *string                `protobuf:"bytes,1,req,name=key" json:"key,omitempty"`

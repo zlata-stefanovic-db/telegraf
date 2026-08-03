@@ -1,7 +1,9 @@
 # Zerobus Output Plugin
 
 This plugin writes metrics to a Unity Catalog Delta table using the
-[Databricks Zerobus Ingest][zerobus] service and its pure-Go SDK.
+[Databricks Zerobus Ingest][zerobus] service and its pure-Go SDK. It supports a
+canonical protobuf schema and an opt-in Unity Catalog mode that derives the
+protobuf schema from the destination table.
 
 ⭐ Telegraf v1.40.0
 🏷️ cloud, datastore
@@ -38,6 +40,18 @@ See the [secret store documentation][SECRETSTORE] for details.
   ## Fully qualified Unity Catalog destination table.
   table_name = "catalog.schema.telegraf_metrics"
 
+  ## Schema mode: canonical uses TelegrafMetric; unity_catalog maps tags and
+  ## fields to columns from the destination table schema.
+  # schema_mode = "canonical"
+
+  ## Timestamp column for unity_catalog mode, encoded as Unix microseconds.
+  # timestamp_column = "timestamp"
+
+  ## Optional measurement-name column for unity_catalog mode.
+  # measurement_column = ""
+
+  ## In unity_catalog mode, uint64 columns must be STRING.
+
   ## OAuth service-principal credentials.
   client_id = ""
   client_secret = ""
@@ -45,52 +59,52 @@ See the [secret store documentation][SECRETSTORE] for details.
   ## Identifier appended to the Zerobus SDK user-agent.
   # application_name = "telegraf"
 
-  ## Maximum number of unacknowledged ingest calls before applying backpressure.
-  ## A value of zero uses the SDK default.
+  ## Schema-fetch timeout; zero uses the SDK default.
+  # schema_fetch_timeout = "0s"
+
+  ## Schema cache TTL; zero uses the default and negative disables caching.
+  # schema_cache_ttl = "0s"
+
+  ## Unacknowledged ingest-call limit; zero uses the SDK default.
   # max_inflight = 0
 
-  ## Maximum encoded payload bytes retained by queued and in-flight records.
-  ## A value of zero uses the SDK default.
+  ## Buffered payload limit; zero uses the SDK default.
   # max_buffered_payload_bytes = "0B"
 
-  ## Maximum records per Zerobus ingest request. Larger Telegraf batches are
-  ## split into multiple requests before one final flush.
+  ## Records per request; larger batches are split.
   # max_batch_records = 100000
 
-  ## Maximum encoded size of one Zerobus ingest request. Larger batches are
-  ## split automatically, but each individual metric must fit this limit.
-  ## A value of zero uses the SDK default, just below the 10 MiB service limit.
+  ## Request size limit; zero uses the SDK default below 10 MiB.
   # max_payload_bytes = "0B"
 
-  ## Maximum consecutive stream-recovery attempts.
-  ## A value of zero uses the SDK default.
+  ## Recovery-attempt limit; zero uses the SDK default.
   # recovery_retries = 0
 
-  ## Timeout for each stream-open attempt during recovery.
-  ## A value of zero uses the SDK default.
+  ## Recovery-attempt timeout; zero uses the SDK default.
   # recovery_timeout = "0s"
 
-  ## Delay between stream-recovery attempts.
-  ## A value of zero uses the SDK default.
+  ## Recovery delay; zero uses the SDK default.
   # recovery_backoff = "0s"
 
-  ## Time records may remain unacknowledged before recovery starts.
-  ## A value of zero uses the SDK default.
+  ## Acknowledgment timeout; zero uses the SDK default.
   # lack_of_ack_timeout = "0s"
 
-  ## Maximum time Write waits for all records in a batch to be acknowledged.
-  ## A value of zero uses the SDK default.
+  ## Flush timeout; zero uses the SDK default.
   # flush_timeout = "0s"
 ```
 
 The service principal identified by `client_id` must have permission to write
-to the configured table. The pure-Go SDK opens a stream asynchronously, so
-network, authentication, and schema errors can first appear during `Write`.
+to the configured table. Canonical streams open asynchronously, so network,
+authentication, and schema errors can first appear during `Write`. Unity
+Catalog mode fetches the table schema during `Connect`; stream-open errors can
+still surface during `Write`.
 
-## Destination table
+## Schema modes
 
-The plugin uses one static protobuf record per Telegraf metric. Create the
-destination table with this exact schema and column order:
+### Canonical schema
+
+Canonical mode is the default. It uses one fixed protobuf record per Telegraf
+metric. Create the destination table with this exact schema and column order:
 
 ```sql
 CREATE TABLE catalog.schema.telegraf_metrics (
@@ -128,6 +142,39 @@ lossless Delta numeric mapping over its full range.
 Exactly one value member is populated for each field. Telegraf normalizes input
 field values to these canonical types before outputs receive them.
 
+### Unity Catalog schema
+
+Set `schema_mode = "unity_catalog"` to fetch the destination table schema from
+Unity Catalog when the stream is created. The SDK builds a protobuf descriptor
+at runtime and converts each JSON record produced by the plugin to protobuf
+before admission.
+
+Unity Catalog mode creates one flat record per metric:
+
+- The metric timestamp is written to `timestamp_column` as Unix microseconds,
+  which is the representation expected by a Delta `TIMESTAMP`.
+- Tags and fields become same-named top-level columns.
+- The measurement name is omitted unless `measurement_column` is configured.
+
+For example, a metric with the tag `host` and field `usage` can target:
+
+```sql
+CREATE TABLE catalog.schema.cpu_metrics (
+  timestamp TIMESTAMP NOT NULL,
+  host STRING,
+  usage DOUBLE
+);
+```
+
+All metrics sent through one plugin instance target the configured table and
+must match its schema. Use Telegraf filtering or processors when separate
+measurements require different tables or column layouts. A tag, field,
+timestamp, or measurement column name collision is rejected before admission.
+Non-finite floats cannot be represented in the intermediate JSON and are also
+rejected.
+Unsigned integers are encoded as decimal strings to preserve the full `uint64`
+range, so their destination columns must be `STRING`.
+
 ## Batching and durability
 
 Telegraf supplies a batch of metrics to each `Write` call. The plugin serializes
@@ -142,8 +189,12 @@ error and plugin log, but the plugin does not silently discard metrics.
 
 The plugin retains admission progress after a failed `Write`. On retry it first
 confirms already admitted requests instead of admitting them again. If SDK
-recovery is exhausted, it creates a new stream and replays only records the SDK
-reports as unacknowledged.
+recovery is exhausted, it creates a new stream. Canonical mode replays only
+records the SDK reports as unacknowledged. Unity Catalog mode re-encodes the
+pending portion from JSON against the newly fetched schema instead of replaying
+protobuf bytes that may use an obsolete descriptor. This can duplicate an
+already acknowledged chunk after a terminal failure, preserving at-least-once
+delivery without risking column corruption.
 
 Each individual serialized metric must fit within the configured payload
 budget. Larger Telegraf batches are split automatically.

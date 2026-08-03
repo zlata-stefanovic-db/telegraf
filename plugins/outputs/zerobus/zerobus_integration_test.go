@@ -33,16 +33,27 @@ func TestConnectAndWriteIntegration(t *testing.T) {
 		}
 		values[name] = value
 	}
+	schemaMode := os.Getenv("ZEROBUS_SCHEMA_MODE")
+	if schemaMode == "" {
+		schemaMode = schemaModeCanonical
+	}
+	timestampColumn := os.Getenv("ZEROBUS_TIMESTAMP_COLUMN")
+	if timestampColumn == "" {
+		timestampColumn = "timestamp"
+	}
 
 	plugin := &Zerobus{
-		ServerEndpoint:  values["ZEROBUS_SERVER_ENDPOINT"],
-		WorkspaceURL:    values["DATABRICKS_WORKSPACE_URL"],
-		TableName:       values["ZEROBUS_TABLE_NAME"],
-		ClientID:        values["DATABRICKS_CLIENT_ID"],
-		ClientSecret:    config.NewSecret([]byte(values["DATABRICKS_CLIENT_SECRET"])),
-		ApplicationName: "telegraf-integration-test",
-		MaxBatchRecords: defaultMaxBatchRecords,
-		Log:             testutil.Logger{},
+		ServerEndpoint:    values["ZEROBUS_SERVER_ENDPOINT"],
+		WorkspaceURL:      values["DATABRICKS_WORKSPACE_URL"],
+		TableName:         values["ZEROBUS_TABLE_NAME"],
+		ClientID:          values["DATABRICKS_CLIENT_ID"],
+		ClientSecret:      config.NewSecret([]byte(values["DATABRICKS_CLIENT_SECRET"])),
+		ApplicationName:   "telegraf-integration-test",
+		SchemaMode:        schemaMode,
+		TimestampColumn:   timestampColumn,
+		MeasurementColumn: os.Getenv("ZEROBUS_MEASUREMENT_COLUMN"),
+		MaxBatchRecords:   defaultMaxBatchRecords,
+		Log:               testutil.Logger{},
 	}
 	require.NoError(t, plugin.Init())
 	require.NoError(t, plugin.Connect())

@@ -29,6 +29,8 @@ const (
 	defaultMaxBatchRecords = 100_000
 	defaultMaxPayloadBytes = 10*1024*1024 - 64*1024
 	batchEnvelopeReserve   = 1024
+	schemaModeCanonical    = "canonical"
+	schemaModeUnityCatalog = "unity_catalog"
 )
 
 type Zerobus struct {
@@ -38,6 +40,12 @@ type Zerobus struct {
 	ClientID        string        `toml:"client_id"`
 	ClientSecret    config.Secret `toml:"client_secret"`
 	ApplicationName string        `toml:"application_name"`
+	SchemaMode      string        `toml:"schema_mode"`
+
+	TimestampColumn    string          `toml:"timestamp_column"`
+	MeasurementColumn  string          `toml:"measurement_column"`
+	SchemaFetchTimeout config.Duration `toml:"schema_fetch_timeout"`
+	SchemaCacheTTL     config.Duration `toml:"schema_cache_ttl"`
 
 	MaxInflight             int             `toml:"max_inflight"`
 	MaxBufferedPayloadBytes config.Size     `toml:"max_buffered_payload_bytes"`
@@ -59,7 +67,7 @@ type Zerobus struct {
 }
 
 type ingestStream interface {
-	IngestRecordsOffset(records [][]byte) (int64, error)
+	IngestRecordsOffset(records [][]byte, encoded bool) (int64, error)
 	Flush() error
 	GetUnackedBatches() ([][][]byte, error)
 	IsClosed() bool
@@ -68,12 +76,23 @@ type ingestStream interface {
 
 type pendingWrite struct {
 	original  [][]byte
-	remaining [][][]byte
+	replay    [][]byte
+	remaining []recordBatch
 	waiting   bool
+}
+
+type recordBatch struct {
+	records [][]byte
+	encoded bool
 }
 
 type sdkClient interface {
 	CreateStream(
+		ctx context.Context,
+		tableName, clientID, clientSecret string,
+		opts ...sdkzerobus.StreamOption,
+	) (ingestStream, error)
+	CreateUnityCatalogStream(
 		ctx context.Context,
 		tableName, clientID, clientSecret string,
 		opts ...sdkzerobus.StreamOption,
@@ -95,7 +114,42 @@ func (s *sdkAdapter) CreateStream(
 	tableName, clientID, clientSecret string,
 	opts ...sdkzerobus.StreamOption,
 ) (ingestStream, error) {
-	return s.SDK.CreateStream(ctx, tableName, clientID, clientSecret, opts...)
+	stream, err := s.SDK.CreateStream(ctx, tableName, clientID, clientSecret, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &staticStreamAdapter{Stream: stream}, nil
+}
+
+func (s *sdkAdapter) CreateUnityCatalogStream(
+	ctx context.Context,
+	tableName, clientID, clientSecret string,
+	opts ...sdkzerobus.StreamOption,
+) (ingestStream, error) {
+	stream, err := s.SDK.CreateDynamicProtoStream(ctx, tableName, clientID, clientSecret, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &unityCatalogStreamAdapter{DynamicProtoStream: stream}, nil
+}
+
+type staticStreamAdapter struct {
+	*sdkzerobus.Stream
+}
+
+func (s *staticStreamAdapter) IngestRecordsOffset(records [][]byte, _ bool) (int64, error) {
+	return s.Stream.IngestRecordsOffset(records)
+}
+
+type unityCatalogStreamAdapter struct {
+	*sdkzerobus.DynamicProtoStream
+}
+
+func (s *unityCatalogStreamAdapter) IngestRecordsOffset(records [][]byte, encoded bool) (int64, error) {
+	if encoded {
+		return s.DynamicProtoStream.Stream.IngestRecordsOffset(records)
+	}
+	return s.DynamicProtoStream.IngestJSONRecordsOffset(records)
 }
 
 func (*Zerobus) SampleConfig() string {
@@ -103,6 +157,28 @@ func (*Zerobus) SampleConfig() string {
 }
 
 func (z *Zerobus) Init() error {
+	z.SchemaMode = strings.ToLower(strings.TrimSpace(z.SchemaMode))
+	z.TimestampColumn = strings.TrimSpace(z.TimestampColumn)
+	z.MeasurementColumn = strings.TrimSpace(z.MeasurementColumn)
+	if z.SchemaMode == "" {
+		z.SchemaMode = schemaModeCanonical
+	}
+	if z.SchemaMode != schemaModeCanonical && z.SchemaMode != schemaModeUnityCatalog {
+		return fmt.Errorf(
+			`option "schema_mode" must be %q or %q`,
+			schemaModeCanonical,
+			schemaModeUnityCatalog,
+		)
+	}
+	if z.SchemaMode == schemaModeUnityCatalog && strings.TrimSpace(z.TimestampColumn) == "" {
+		return errors.New(`option "timestamp_column" must be set in unity_catalog schema mode`)
+	}
+	if z.SchemaMode == schemaModeUnityCatalog &&
+		z.MeasurementColumn != "" &&
+		z.MeasurementColumn == z.TimestampColumn {
+		return errors.New(`options "measurement_column" and "timestamp_column" must be different`)
+	}
+
 	requiredStrings := []struct {
 		name  string
 		value string
@@ -141,6 +217,9 @@ func (z *Zerobus) Init() error {
 	}
 	if z.RecoveryRetries < 0 {
 		return errors.New(`option "recovery_retries" cannot be negative`)
+	}
+	if z.SchemaFetchTimeout < 0 {
+		return errors.New(`option "schema_fetch_timeout" cannot be negative`)
 	}
 	for _, option := range []struct {
 		name  string
@@ -182,6 +261,20 @@ func (z *Zerobus) Connect() error {
 	if z.ApplicationName != "" {
 		sdkOptions = append(sdkOptions, sdkzerobus.WithApplicationName(z.ApplicationName))
 	}
+	if z.SchemaMode == schemaModeUnityCatalog {
+		if z.SchemaFetchTimeout > 0 {
+			sdkOptions = append(
+				sdkOptions,
+				sdkzerobus.WithDynamicSchemaFetchTimeout(time.Duration(z.SchemaFetchTimeout)),
+			)
+		}
+		if z.SchemaCacheTTL != 0 {
+			sdkOptions = append(
+				sdkOptions,
+				sdkzerobus.WithDynamicSchemaCacheTTL(time.Duration(z.SchemaCacheTTL)),
+			)
+		}
+	}
 	sdk, err := z.newSDK(z.ServerEndpoint, z.WorkspaceURL, sdkOptions...)
 	if err != nil {
 		return fmt.Errorf("creating Zerobus SDK failed: %w", err)
@@ -212,7 +305,7 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 		z.confirmed = pendingOriginal
 	}
 
-	records, err := serializeMetrics(metrics)
+	records, err := z.serializeMetrics(metrics)
 	if err != nil {
 		return err
 	}
@@ -235,6 +328,7 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 	}
 	z.pending = &pendingWrite{
 		original:  original,
+		replay:    records,
 		remaining: chunks,
 	}
 	z.confirmed = nil
@@ -257,17 +351,33 @@ func (z *Zerobus) Close() error {
 }
 
 func (z *Zerobus) openStream(clientSecret string) error {
-	descriptor, err := messageDescriptor()
-	if err != nil {
-		return fmt.Errorf("building protobuf descriptor failed: %w", err)
-	}
-	stream, err := z.sdk.CreateStream(
-		context.Background(),
-		z.TableName,
-		z.ClientID,
-		clientSecret,
-		z.streamOptions(descriptor)...,
+	options := z.streamOptions()
+	var (
+		stream ingestStream
+		err    error
 	)
+	if z.SchemaMode == schemaModeUnityCatalog {
+		stream, err = z.sdk.CreateUnityCatalogStream(
+			context.Background(),
+			z.TableName,
+			z.ClientID,
+			clientSecret,
+			options...,
+		)
+	} else {
+		descriptor, descriptorErr := messageDescriptor()
+		if descriptorErr != nil {
+			return fmt.Errorf("building protobuf descriptor failed: %w", descriptorErr)
+		}
+		options = append([]sdkzerobus.StreamOption{sdkzerobus.WithProto(descriptor)}, options...)
+		stream, err = z.sdk.CreateStream(
+			context.Background(),
+			z.TableName,
+			z.ClientID,
+			clientSecret,
+			options...,
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -282,7 +392,21 @@ func (z *Zerobus) recreateStream() error {
 	}
 	_ = z.stream.Close()
 	z.stream = nil
-	z.pending.remaining = append(unacked, z.pending.remaining...)
+	if z.SchemaMode == schemaModeUnityCatalog {
+		if len(unacked) > 0 {
+			replay, chunkErr := z.chunkRecords(z.pending.replay)
+			if chunkErr != nil {
+				return fmt.Errorf("rebuilding Unity Catalog replay batches failed: %w", chunkErr)
+			}
+			z.pending.remaining = replay
+		}
+	} else {
+		replay := make([]recordBatch, 0, len(unacked)+len(z.pending.remaining))
+		for _, batch := range unacked {
+			replay = append(replay, recordBatch{records: batch, encoded: true})
+		}
+		z.pending.remaining = append(replay, z.pending.remaining...)
+	}
 	z.pending.waiting = false
 
 	return z.openStreamFromSecret()
@@ -320,7 +444,7 @@ func (z *Zerobus) processPending() error {
 
 	for len(z.pending.remaining) > 0 {
 		chunk := z.pending.remaining[0]
-		if _, err := z.stream.IngestRecordsOffset(chunk); err != nil {
+		if _, err := z.stream.IngestRecordsOffset(chunk.records, chunk.encoded); err != nil {
 			return z.writeError("admitting batch", err)
 		}
 		z.pending.remaining = z.pending.remaining[1:]
@@ -336,7 +460,7 @@ func (z *Zerobus) processPending() error {
 	return nil
 }
 
-func (z *Zerobus) chunkRecords(records [][]byte) ([][][]byte, error) {
+func (z *Zerobus) chunkRecords(records [][]byte) ([]recordBatch, error) {
 	maxBytes := int(z.MaxPayloadBytes)
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxPayloadBytes
@@ -350,7 +474,7 @@ func (z *Zerobus) chunkRecords(records [][]byte) ([][][]byte, error) {
 		)
 	}
 
-	chunks := make([][][]byte, 0, (len(records)+z.MaxBatchRecords-1)/z.MaxBatchRecords)
+	chunks := make([]recordBatch, 0, (len(records)+z.MaxBatchRecords-1)/z.MaxBatchRecords)
 	for len(records) > 0 {
 		count, size := 0, 0
 		for count < len(records) && count < z.MaxBatchRecords {
@@ -369,7 +493,7 @@ func (z *Zerobus) chunkRecords(records [][]byte) ([][][]byte, error) {
 			size += recordSize
 			count++
 		}
-		chunks = append(chunks, records[:count])
+		chunks = append(chunks, recordBatch{records: records[:count]})
 		records = records[count:]
 	}
 	return chunks, nil
@@ -392,13 +516,20 @@ func serializeMetrics(metrics []telegraf.Metric) ([][]byte, error) {
 	return records, nil
 }
 
+func (z *Zerobus) serializeMetrics(metrics []telegraf.Metric) ([][]byte, error) {
+	if z.SchemaMode == schemaModeUnityCatalog {
+		return serializeUnityCatalogMetrics(metrics, z.TimestampColumn, z.MeasurementColumn)
+	}
+	return serializeMetrics(metrics)
+}
+
 func recordsHavePrefix(records, prefix [][]byte) bool {
 	return len(records) >= len(prefix) &&
 		slices.EqualFunc(records[:len(prefix)], prefix, slices.Equal)
 }
 
-func (z *Zerobus) streamOptions(descriptor []byte) []sdkzerobus.StreamOption {
-	options := []sdkzerobus.StreamOption{sdkzerobus.WithProto(descriptor)}
+func (z *Zerobus) streamOptions() []sdkzerobus.StreamOption {
+	options := make([]sdkzerobus.StreamOption, 0, 9)
 	if z.MaxInflight > 0 {
 		options = append(options, sdkzerobus.WithMaxInflight(z.MaxInflight))
 	}
@@ -446,6 +577,8 @@ func init() {
 	outputs.Add("zerobus", func() telegraf.Output {
 		return &Zerobus{
 			ApplicationName: "telegraf",
+			SchemaMode:      schemaModeCanonical,
+			TimestampColumn: "timestamp",
 			MaxBatchRecords: defaultMaxBatchRecords,
 		}
 	})

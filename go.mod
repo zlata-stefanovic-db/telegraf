@@ -79,7 +79,7 @@ require (
 	github.com/coreos/go-semver v0.3.1
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/couchbase/go-couchbase v0.1.1
-	github.com/databricks/zerobus-sdk/purego v0.0.0-20260803125102-f294d5a6c056
+	github.com/databricks/zerobus-sdk/purego v0.0.0-20260803152638-daaef2b91dd5
 	github.com/datadope-io/go-zabbix/v2 v2.0.1
 	github.com/digitalocean/go-libvirt v0.0.0-20250417173424-a6a66ef779d6
 	github.com/dimchansky/utfbom v1.1.1

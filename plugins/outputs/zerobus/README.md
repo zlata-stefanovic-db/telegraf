@@ -44,7 +44,8 @@ See the [secret store documentation][SECRETSTORE] for details.
   ## fields to columns from the destination table schema.
   # schema_mode = "canonical"
 
-  ## Timestamp column for unity_catalog mode, encoded as Unix microseconds.
+  ## Optional timestamp column for unity_catalog mode, encoded as Unix
+  ## microseconds. Leave empty if the table has no timestamp column.
   # timestamp_column = "timestamp"
 
   ## Optional measurement-name column for unity_catalog mode.
@@ -153,8 +154,8 @@ before admission.
 
 Unity Catalog mode creates one flat record per metric:
 
-- The metric timestamp is written to `timestamp_column` as Unix microseconds,
-  which is the representation expected by a Delta `TIMESTAMP`.
+- If configured, the metric timestamp is written to `timestamp_column` as Unix
+  microseconds, which is the representation expected by a Delta `TIMESTAMP`.
 - Tags and fields become same-named top-level columns.
 - The measurement name is omitted unless `measurement_column` is configured.
 
@@ -170,8 +171,8 @@ CREATE TABLE catalog.schema.cpu_metrics (
 
 All metrics sent through one plugin instance target the configured table and
 must match its schema. Use Telegraf filtering or processors when separate
-measurements require different tables or column layouts. A tag, field,
-timestamp, or measurement column name collision is rejected before admission.
+measurements require different tables or column layouts. A tag, field, or
+configured metadata-column name collision is rejected before admission.
 Non-finite floats cannot be represented in the intermediate JSON and are also
 rejected.
 Unsigned integers are encoded as decimal strings to preserve the full `uint64`

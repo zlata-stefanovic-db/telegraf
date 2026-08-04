@@ -34,7 +34,9 @@ func metricToUnityCatalogJSON(
 	timestampColumn, measurementColumn string,
 ) ([]byte, error) {
 	values := make(map[string]interface{}, len(metric.TagList())+len(metric.FieldList())+2)
-	values[timestampColumn] = metric.Time().UnixMicro()
+	if timestampColumn != "" {
+		values[timestampColumn] = metric.Time().UnixMicro()
+	}
 	if measurementColumn != "" {
 		values[measurementColumn] = metric.Name()
 	}

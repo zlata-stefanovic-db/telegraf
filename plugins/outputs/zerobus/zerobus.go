@@ -173,9 +173,6 @@ func (z *Zerobus) Init() error {
 			schemaModeUnityCatalog,
 		)
 	}
-	if z.SchemaMode == schemaModeUnityCatalog && strings.TrimSpace(z.TimestampColumn) == "" {
-		return errors.New(`option "timestamp_column" must be set in unity_catalog schema mode`)
-	}
 	if z.SchemaMode == schemaModeUnityCatalog &&
 		z.MeasurementColumn != "" &&
 		z.MeasurementColumn == z.TimestampColumn {

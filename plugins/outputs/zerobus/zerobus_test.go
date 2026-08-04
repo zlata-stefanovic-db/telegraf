@@ -170,11 +170,11 @@ func TestInitSchemaMode(t *testing.T) {
 		require.ErrorContains(t, plugin.Init(), "schema_mode")
 	})
 
-	t.Run("requires Unity Catalog timestamp column", func(t *testing.T) {
+	t.Run("allows omitted timestamp column", func(t *testing.T) {
 		plugin := validPlugin()
 		plugin.SchemaMode = schemaModeUnityCatalog
 		plugin.TimestampColumn = ""
-		require.ErrorContains(t, plugin.Init(), "timestamp_column")
+		require.NoError(t, plugin.Init())
 	})
 
 	t.Run("rejects reserved column collision", func(t *testing.T) {
@@ -288,6 +288,13 @@ func TestMetricToUnityCatalogJSONFlattensMetric(t *testing.T) {
 	require.JSONEq(t, `1.25`, string(values["ratio"]))
 	require.JSONEq(t, `true`, string(values["active"]))
 	require.JSONEq(t, `"ready"`, string(values["status"]))
+
+	record, err = metricToUnityCatalogJSON(input, "", "")
+	require.NoError(t, err)
+	values = nil
+	require.NoError(t, json.Unmarshal(record, &values))
+	require.NotContains(t, values, "event_time")
+	require.NotContains(t, values, "measurement")
 }
 
 func TestMetricToUnityCatalogJSONRejectsInvalidMetric(t *testing.T) {

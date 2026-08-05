@@ -651,7 +651,7 @@ func TestWritePreservesCumulativeIdentityAcrossSuffixFailure(t *testing.T) {
 	require.Nil(t, plugin.pending)
 }
 
-func TestWritePreservesConfirmedPrefixAcrossSerializationFailure(t *testing.T) {
+func TestWriteReturnsPartialErrorAfterPendingWriteSucceeds(t *testing.T) {
 	flushErr := errors.New("flush timed out")
 	stream := &fakeStream{flushErrors: []error{flushErr, nil, nil}}
 	plugin := validPlugin()
@@ -667,10 +667,13 @@ func TestWritePreservesConfirmedPrefixAcrossSerializationFailure(t *testing.T) {
 
 	require.ErrorIs(t, plugin.Write([]telegraf.Metric{original}), flushErr)
 	err := plugin.Write([]telegraf.Metric{original, unsupported})
-	require.ErrorContains(t, err, "unsupported field type")
-	require.NotNil(t, plugin.confirmed)
+	var writeErr *internal.PartialWriteError
+	require.ErrorAs(t, err, &writeErr)
+	require.Equal(t, []int{0}, writeErr.MetricsAccept)
+	require.Equal(t, []int{1}, writeErr.MetricsReject)
+	require.Nil(t, plugin.confirmed)
 
-	require.NoError(t, plugin.Write([]telegraf.Metric{original, added}))
+	require.NoError(t, plugin.Write([]telegraf.Metric{added}))
 	require.Equal(t, 2, stream.ingestCalls)
 	expectedAdded, err := serializeMetrics([]telegraf.Metric{added})
 	require.NoError(t, err)
@@ -813,6 +816,29 @@ func TestWriteTableSchemaReplaysOnlyCurrentSuffix(t *testing.T) {
 	require.Equal(t, []bool{false}, replacement.encoded)
 }
 
+func TestWriteTableSchemaReplaysOnlyUnacknowledgedChunk(t *testing.T) {
+	flushErr := errors.New("flush failed")
+	closed := &fakeStream{flushErrors: []error{flushErr}}
+	replacement := &fakeStream{}
+	sdk := &fakeSDK{stream: replacement}
+	plugin := validPlugin()
+	plugin.SchemaMode = schemaModeTableSchema
+	plugin.MaxBatchRecords = 1
+	plugin.sdk = sdk
+	plugin.stream = closed
+	input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
+
+	require.ErrorIs(t, plugin.Write(input), flushErr)
+	require.Len(t, closed.batches, 2)
+	closed.unacked = [][][]byte{{{0x08, 0x01}}}
+	closed.closed = true
+
+	require.NoError(t, plugin.Write(input))
+	require.Len(t, replacement.batches, 1)
+	require.Equal(t, closed.batches[1], replacement.batches[0])
+	require.Equal(t, []bool{false}, replacement.encoded)
+}
+
 func TestWriteRejectsIndividuallyOversizedMetricBeforeAdmission(t *testing.T) {
 	stream := &fakeStream{}
 	plugin := validPlugin()
@@ -821,6 +847,49 @@ func TestWriteRejectsIndividuallyOversizedMetricBeforeAdmission(t *testing.T) {
 
 	err := plugin.Write([]telegraf.Metric{testutil.TestMetric(1)})
 	require.ErrorContains(t, err, "exceeding the payload budget")
+	require.Zero(t, stream.ingestCalls)
+}
+
+func TestWriteRejectsInvalidMetricWithoutBlockingValidMetrics(t *testing.T) {
+	stream := &fakeStream{}
+	plugin := validPlugin()
+	plugin.stream = stream
+	input := []telegraf.Metric{
+		testutil.TestMetric(1),
+		metricWithFields{
+			Metric: testutil.TestMetric(2),
+			fields: []*telegraf.Field{{Key: "unsupported", Value: complex(1, 2)}},
+		},
+		testutil.TestMetric(3),
+	}
+
+	err := plugin.Write(input)
+	var writeErr *internal.PartialWriteError
+	require.ErrorAs(t, err, &writeErr)
+	require.Equal(t, []int{0, 2}, writeErr.MetricsAccept)
+	require.Equal(t, []int{1}, writeErr.MetricsReject)
+	require.Len(t, writeErr.MetricsRejectErrors, 1)
+	require.ErrorContains(t, writeErr.MetricsRejectErrors[0], "unsupported field type")
+	require.Equal(t, 1, stream.ingestCalls)
+	require.Len(t, stream.batches[0], 2)
+	require.Equal(t, 1, stream.flushCalls)
+}
+
+func TestWriteRejectsMetricExceedingBufferedPayloadLimit(t *testing.T) {
+	record, err := serializeMetric(testutil.TestMetric(1))
+	require.NoError(t, err)
+	recordSize := protowire.SizeTag(1) + protowire.SizeBytes(len(record))
+
+	stream := &fakeStream{}
+	plugin := validPlugin()
+	plugin.MaxBufferedPayloadBytes = config.Size(retainedPayloadSize(recordSize, 1) - 1)
+	plugin.stream = stream
+
+	err = plugin.Write([]telegraf.Metric{testutil.TestMetric(1)})
+	var writeErr *internal.PartialWriteError
+	require.ErrorAs(t, err, &writeErr)
+	require.Equal(t, []int{0}, writeErr.MetricsReject)
+	require.ErrorContains(t, err, "max_buffered_payload_bytes")
 	require.Zero(t, stream.ingestCalls)
 }
 
@@ -839,6 +908,28 @@ func TestWriteSplitsBatchByPayloadSize(t *testing.T) {
 	require.NoError(t, plugin.Write(input))
 	require.Equal(t, 2, stream.ingestCalls)
 	require.Len(t, stream.batches, 2)
+	require.Len(t, stream.batches[0], 1)
+	require.Len(t, stream.batches[1], 1)
+	require.Equal(t, 1, stream.flushCalls)
+}
+
+func TestWriteSplitsBatchByBufferedPayloadSize(t *testing.T) {
+	input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
+	records, err := serializeMetrics(input)
+	require.NoError(t, err)
+	firstSize := protowire.SizeTag(1) + protowire.SizeBytes(len(records[0]))
+	secondSize := protowire.SizeTag(1) + protowire.SizeBytes(len(records[1]))
+
+	stream := &fakeStream{}
+	plugin := validPlugin()
+	plugin.MaxBufferedPayloadBytes = config.Size(max(
+		retainedPayloadSize(firstSize, 1),
+		retainedPayloadSize(secondSize, 1),
+	))
+	plugin.stream = stream
+
+	require.NoError(t, plugin.Write(input))
+	require.Equal(t, 2, stream.ingestCalls)
 	require.Len(t, stream.batches[0], 1)
 	require.Len(t, stream.batches[1], 1)
 	require.Equal(t, 1, stream.flushCalls)

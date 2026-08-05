@@ -181,26 +181,25 @@ range, so their destination columns must be `STRING`.
 ## Batching and durability
 
 Telegraf supplies a batch of metrics to each `Write` call. The plugin serializes
-the complete batch before admitting it, splits it into requests that satisfy
-`max_batch_records` and `max_payload_bytes`, queues those requests with
+each metric, splits valid records into requests that satisfy the record,
+payload, and buffered-payload limits, queues those requests with
 `IngestRecordsOffset`, and calls `Flush` once. A successful `Write` therefore
-means the full Telegraf batch was acknowledged. It never waits per record.
+means all valid records were acknowledged. It never waits per record.
 
 Admission and acknowledgment failures are returned to Telegraf, which keeps the
-original metrics for retry. Errors include their retryability, and the plugin
-does not silently discard metrics.
+original metrics for retry. A deterministic serialization or size failure
+rejects only the affected metric and reports its error to Telegraf; valid
+metrics in the same batch are still written.
 
 The plugin retains admission progress after a failed `Write`. On retry it first
 confirms already admitted requests instead of admitting them again. If SDK
 recovery is exhausted, it creates a new stream. Static mode replays only
 records the SDK reports as unacknowledged. Table-schema mode re-encodes the
 pending portion from JSON against the newly fetched schema instead of replaying
-protobuf bytes that may use an obsolete descriptor. This can duplicate an
-already acknowledged chunk after a terminal failure, preserving at-least-once
-delivery without risking column corruption.
+protobuf bytes that may use an obsolete descriptor.
 
 Each individual serialized metric must fit within the configured payload
-budget. Larger Telegraf batches are split automatically.
+and buffered-payload budgets. Larger Telegraf batches are split automatically.
 
 ## Development: regenerating the protobuf binding
 

@@ -26,12 +26,14 @@ import (
 var sampleConfig string
 
 const (
-	defaultMaxBatchRecords = 100_000
-	defaultMaxPayloadBytes = 10*1024*1024 - 64*1024
-	defaultConnectTimeout  = 30 * time.Second
-	batchEnvelopeReserve   = 1024
-	schemaModeStatic       = "static"
-	schemaModeTableSchema  = "table_schema"
+	defaultMaxBatchRecords  = 100_000
+	defaultMaxPayloadBytes  = 10*1024*1024 - 64*1024
+	defaultConnectTimeout   = 30 * time.Second
+	batchEnvelopeReserve    = 1024
+	bufferedRequestOverhead = 512
+	bufferedRecordOverhead  = 32
+	schemaModeStatic        = "static"
+	schemaModeTableSchema   = "table_schema"
 )
 
 type Zerobus struct {
@@ -76,7 +78,7 @@ type ingestStream interface {
 
 type pendingWrite struct {
 	original  [][]byte
-	replay    [][]byte
+	admitted  []recordBatch
 	remaining []recordBatch
 	waiting   bool
 }
@@ -84,6 +86,13 @@ type pendingWrite struct {
 type recordBatch struct {
 	records [][]byte
 	encoded bool
+}
+
+type preparedWrite struct {
+	records      [][]byte
+	accept       []int
+	reject       []int
+	rejectErrors []error
 }
 
 type sdkClient interface {
@@ -318,9 +327,11 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 		z.confirmed = pendingOriginal
 	}
 
-	records, err := z.serializeMetrics(metrics)
-	if err != nil {
-		return err
+	prepared := z.prepareMetrics(metrics)
+	records := prepared.records
+	if len(records) == 0 {
+		z.confirmed = nil
+		return prepared.result()
 	}
 	original := records
 	if z.confirmed != nil {
@@ -328,7 +339,7 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 			records = records[len(z.confirmed):]
 			if len(records) == 0 {
 				z.confirmed = nil
-				return nil
+				return prepared.result()
 			}
 		} else {
 			z.confirmed = nil
@@ -341,11 +352,13 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 	}
 	z.pending = &pendingWrite{
 		original:  original,
-		replay:    records,
 		remaining: chunks,
 	}
 	z.confirmed = nil
-	return z.processPending()
+	if err := z.processPending(); err != nil {
+		return err
+	}
+	return prepared.result()
 }
 
 func (z *Zerobus) Close() error {
@@ -406,12 +419,18 @@ func (z *Zerobus) recreateStream() error {
 	_ = z.stream.Close()
 	z.stream = nil
 	if z.SchemaMode == schemaModeTableSchema {
+		if len(unacked) > len(z.pending.admitted) {
+			return fmt.Errorf(
+				"rebuilding table-schema replay batches failed: SDK returned %d "+
+					"unacknowledged batches for %d admitted batches",
+				len(unacked),
+				len(z.pending.admitted),
+			)
+		}
 		if len(unacked) > 0 {
-			replay, chunkErr := z.chunkRecords(z.pending.replay)
-			if chunkErr != nil {
-				return fmt.Errorf("rebuilding table-schema replay batches failed: %w", chunkErr)
-			}
-			z.pending.remaining = replay
+			start := len(z.pending.admitted) - len(unacked)
+			replay := slices.Clone(z.pending.admitted[start:])
+			z.pending.remaining = append(replay, z.pending.remaining...)
 		}
 	} else {
 		replay := make([]recordBatch, 0, len(unacked)+len(z.pending.remaining))
@@ -420,6 +439,7 @@ func (z *Zerobus) recreateStream() error {
 		}
 		z.pending.remaining = append(replay, z.pending.remaining...)
 	}
+	z.pending.admitted = nil
 	z.pending.waiting = false
 
 	return z.openStreamFromSecret()
@@ -455,6 +475,7 @@ func (z *Zerobus) processPending() error {
 			return z.writeError("flushing previously admitted batch", err)
 		}
 		z.pending.waiting = false
+		z.pending.admitted = nil
 	}
 
 	for len(z.pending.remaining) > 0 {
@@ -463,6 +484,7 @@ func (z *Zerobus) processPending() error {
 			return z.writeError("admitting batch", err)
 		}
 		z.pending.remaining = z.pending.remaining[1:]
+		z.pending.admitted = append(z.pending.admitted, chunk)
 		z.pending.waiting = true
 	}
 
@@ -494,15 +516,19 @@ func (z *Zerobus) chunkRecords(records [][]byte) ([]recordBatch, error) {
 		count, size := 0, 0
 		for count < len(records) && count < z.MaxBatchRecords {
 			recordSize := protowire.SizeTag(1) + protowire.SizeBytes(len(records[count]))
-			if recordSize > payloadBudget {
+			if err := z.validateRecordSize(recordSize, payloadBudget); err != nil {
 				return nil, fmt.Errorf(
-					"serialized metric %d requires %d bytes, exceeding the payload budget of %d bytes",
+					"serialized metric %d cannot be admitted: %w",
 					count,
-					recordSize,
-					payloadBudget,
+					err,
 				)
 			}
 			if size+recordSize > payloadBudget {
+				break
+			}
+			if z.MaxBufferedPayloadBytes > 0 &&
+				retainedPayloadSize(size+recordSize, count+1) >
+					int64(z.MaxBufferedPayloadBytes) {
 				break
 			}
 			size += recordSize
@@ -514,28 +540,107 @@ func (z *Zerobus) chunkRecords(records [][]byte) ([]recordBatch, error) {
 	return chunks, nil
 }
 
+func (z *Zerobus) prepareMetrics(metrics []telegraf.Metric) preparedWrite {
+	prepared := preparedWrite{
+		records: make([][]byte, 0, len(metrics)),
+		accept:  make([]int, 0, len(metrics)),
+	}
+	maxBytes := int(z.MaxPayloadBytes)
+	if maxBytes <= 0 {
+		maxBytes = defaultMaxPayloadBytes
+	}
+	payloadBudget := maxBytes - batchEnvelopeReserve
+
+	for i, metric := range metrics {
+		record, err := z.serializeMetric(metric)
+		if err == nil {
+			recordSize := protowire.SizeTag(1) + protowire.SizeBytes(len(record))
+			err = z.validateRecordSize(recordSize, payloadBudget)
+		}
+		if err != nil {
+			prepared.reject = append(prepared.reject, i)
+			prepared.rejectErrors = append(prepared.rejectErrors, err)
+			continue
+		}
+		prepared.records = append(prepared.records, record)
+		prepared.accept = append(prepared.accept, i)
+	}
+	return prepared
+}
+
+func (p *preparedWrite) result() error {
+	if len(p.reject) == 0 {
+		return nil
+	}
+	return &internal.PartialWriteError{
+		Err: fmt.Errorf(
+			"Zerobus rejected %d metric(s): %w",
+			len(p.reject),
+			errors.Join(p.rejectErrors...),
+		),
+		MetricsAccept:       p.accept,
+		MetricsReject:       p.reject,
+		MetricsRejectErrors: p.rejectErrors,
+	}
+}
+
+func (z *Zerobus) validateRecordSize(recordSize, payloadBudget int) error {
+	if recordSize > payloadBudget {
+		return fmt.Errorf(
+			"requires %d bytes, exceeding the payload budget of %d bytes",
+			recordSize,
+			payloadBudget,
+		)
+	}
+	if z.MaxBufferedPayloadBytes > 0 {
+		retained := retainedPayloadSize(recordSize, 1)
+		if retained > int64(z.MaxBufferedPayloadBytes) {
+			return fmt.Errorf(
+				"requires approximately %d buffered bytes, exceeding "+
+					"max_buffered_payload_bytes=%d",
+				retained,
+				z.MaxBufferedPayloadBytes,
+			)
+		}
+	}
+	return nil
+}
+
+func retainedPayloadSize(recordBytes, recordCount int) int64 {
+	return int64(recordBytes) +
+		int64(recordCount)*bufferedRecordOverhead +
+		bufferedRequestOverhead
+}
+
 func serializeMetrics(metrics []telegraf.Metric) ([][]byte, error) {
 	records := make([][]byte, 0, len(metrics))
-	marshaller := proto.MarshalOptions{Deterministic: true}
 	for _, metric := range metrics {
-		record, err := metricToProto(metric)
+		serialized, err := serializeMetric(metric)
 		if err != nil {
-			return nil, fmt.Errorf("serializing metric failed: %w", err)
-		}
-		serialized, err := marshaller.Marshal(record)
-		if err != nil {
-			return nil, fmt.Errorf("marshaling protobuf record failed: %w", err)
+			return nil, err
 		}
 		records = append(records, serialized)
 	}
 	return records, nil
 }
 
-func (z *Zerobus) serializeMetrics(metrics []telegraf.Metric) ([][]byte, error) {
-	if z.SchemaMode == schemaModeTableSchema {
-		return serializeTableSchemaMetrics(metrics, z.TimestampColumn, z.MeasurementColumn)
+func serializeMetric(metric telegraf.Metric) ([]byte, error) {
+	record, err := metricToProto(metric)
+	if err != nil {
+		return nil, fmt.Errorf("serializing metric failed: %w", err)
 	}
-	return serializeMetrics(metrics)
+	serialized, err := (proto.MarshalOptions{Deterministic: true}).Marshal(record)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling protobuf record failed: %w", err)
+	}
+	return serialized, nil
+}
+
+func (z *Zerobus) serializeMetric(metric telegraf.Metric) ([]byte, error) {
+	if z.SchemaMode == schemaModeTableSchema {
+		return metricToTableSchemaJSON(metric, z.TimestampColumn, z.MeasurementColumn)
+	}
+	return serializeMetric(metric)
 }
 
 func recordsHavePrefix(records, prefix [][]byte) bool {

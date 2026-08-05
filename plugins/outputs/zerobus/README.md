@@ -2,7 +2,7 @@
 
 This plugin writes metrics to a Unity Catalog Delta table using the
 [Databricks Zerobus Ingest][zerobus] service and its pure-Go SDK. It supports a
-canonical protobuf schema and an opt-in Unity Catalog mode that derives the
+static protobuf schema and an opt-in table-schema mode that derives the
 protobuf schema from the destination table.
 
 ⭐ Telegraf v1.40.0
@@ -40,18 +40,18 @@ See the [secret store documentation][SECRETSTORE] for details.
   ## Fully qualified Unity Catalog destination table.
   table_name = "catalog.schema.telegraf_metrics"
 
-  ## Schema mode: canonical uses TelegrafMetric; unity_catalog maps tags and
+  ## Schema mode: static uses TelegrafMetric; table_schema maps tags and
   ## fields to columns from the destination table schema.
-  # schema_mode = "canonical"
+  # schema_mode = "static"
 
-  ## Optional timestamp column for unity_catalog mode, encoded as Unix
+  ## Optional timestamp column for table_schema mode, encoded as Unix
   ## microseconds. Leave empty if the table has no timestamp column.
   # timestamp_column = "timestamp"
 
-  ## Optional measurement-name column for unity_catalog mode.
+  ## Optional measurement-name column for table_schema mode.
   # measurement_column = ""
 
-  ## In unity_catalog mode, uint64 columns must be STRING.
+  ## In table_schema mode, uint64 columns must be STRING.
 
   ## OAuth service-principal credentials.
   client_id = ""
@@ -104,9 +104,9 @@ metrics are written.
 
 ## Schema modes
 
-### Canonical schema
+### Static schema
 
-Canonical mode is the default. It uses one fixed protobuf record per Telegraf
+Static mode is the default. It uses one fixed protobuf record per Telegraf
 metric. Create the destination table with this exact schema and column order:
 
 ```sql
@@ -143,16 +143,16 @@ lossless Delta numeric mapping over its full range.
 - `string` becomes `type = "string"` and `string_value`.
 
 Exactly one value member is populated for each field. Telegraf normalizes input
-field values to these canonical types before outputs receive them.
+field values to these supported types before outputs receive them.
 
-### Unity Catalog schema
+### Table schema
 
-Set `schema_mode = "unity_catalog"` to fetch the destination table schema from
+Set `schema_mode = "table_schema"` to fetch the destination table schema from
 Unity Catalog when the stream is created. The SDK builds a protobuf descriptor
 at runtime and converts each JSON record produced by the plugin to protobuf
 before admission.
 
-Unity Catalog mode creates one flat record per metric:
+Table-schema mode creates one flat record per metric:
 
 - If configured, the metric timestamp is written to `timestamp_column` as Unix
   microseconds, which is the representation expected by a Delta `TIMESTAMP`.
@@ -192,8 +192,8 @@ does not silently discard metrics.
 
 The plugin retains admission progress after a failed `Write`. On retry it first
 confirms already admitted requests instead of admitting them again. If SDK
-recovery is exhausted, it creates a new stream. Canonical mode replays only
-records the SDK reports as unacknowledged. Unity Catalog mode re-encodes the
+recovery is exhausted, it creates a new stream. Static mode replays only
+records the SDK reports as unacknowledged. Table-schema mode re-encodes the
 pending portion from JSON against the newly fetched schema instead of replaying
 protobuf bytes that may use an obsolete descriptor. This can duplicate an
 already acknowledged chunk after a terminal failure, preserving at-least-once

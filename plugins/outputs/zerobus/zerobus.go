@@ -30,8 +30,8 @@ const (
 	defaultMaxPayloadBytes = 10*1024*1024 - 64*1024
 	defaultConnectTimeout  = 30 * time.Second
 	batchEnvelopeReserve   = 1024
-	schemaModeCanonical    = "canonical"
-	schemaModeUnityCatalog = "unity_catalog"
+	schemaModeStatic       = "static"
+	schemaModeTableSchema  = "table_schema"
 )
 
 type Zerobus struct {
@@ -92,7 +92,7 @@ type sdkClient interface {
 		tableName, clientID, clientSecret string,
 		opts ...sdkzerobus.StreamOption,
 	) (ingestStream, error)
-	CreateUnityCatalogStream(
+	CreateTableSchemaStream(
 		ctx context.Context,
 		tableName, clientID, clientSecret string,
 		opts ...sdkzerobus.StreamOption,
@@ -121,7 +121,7 @@ func (s *sdkAdapter) CreateStream(
 	return &staticStreamAdapter{Stream: stream}, nil
 }
 
-func (s *sdkAdapter) CreateUnityCatalogStream(
+func (s *sdkAdapter) CreateTableSchemaStream(
 	ctx context.Context,
 	tableName, clientID, clientSecret string,
 	opts ...sdkzerobus.StreamOption,
@@ -130,7 +130,7 @@ func (s *sdkAdapter) CreateUnityCatalogStream(
 	if err != nil {
 		return nil, err
 	}
-	return &unityCatalogStreamAdapter{DynamicProtoStream: stream}, nil
+	return &tableSchemaStreamAdapter{DynamicProtoStream: stream}, nil
 }
 
 type staticStreamAdapter struct {
@@ -141,11 +141,11 @@ func (s *staticStreamAdapter) IngestRecordsOffset(records [][]byte, _ bool) (int
 	return s.Stream.IngestRecordsOffset(records)
 }
 
-type unityCatalogStreamAdapter struct {
+type tableSchemaStreamAdapter struct {
 	*sdkzerobus.DynamicProtoStream
 }
 
-func (s *unityCatalogStreamAdapter) IngestRecordsOffset(
+func (s *tableSchemaStreamAdapter) IngestRecordsOffset(
 	records [][]byte,
 	encoded bool,
 ) (int64, error) {
@@ -164,16 +164,16 @@ func (z *Zerobus) Init() error {
 	z.TimestampColumn = strings.TrimSpace(z.TimestampColumn)
 	z.MeasurementColumn = strings.TrimSpace(z.MeasurementColumn)
 	if z.SchemaMode == "" {
-		z.SchemaMode = schemaModeCanonical
+		z.SchemaMode = schemaModeStatic
 	}
-	if z.SchemaMode != schemaModeCanonical && z.SchemaMode != schemaModeUnityCatalog {
+	if z.SchemaMode != schemaModeStatic && z.SchemaMode != schemaModeTableSchema {
 		return fmt.Errorf(
 			`option "schema_mode" must be %q or %q`,
-			schemaModeCanonical,
-			schemaModeUnityCatalog,
+			schemaModeStatic,
+			schemaModeTableSchema,
 		)
 	}
-	if z.SchemaMode == schemaModeUnityCatalog &&
+	if z.SchemaMode == schemaModeTableSchema &&
 		z.MeasurementColumn != "" &&
 		z.MeasurementColumn == z.TimestampColumn {
 		return errors.New(`options "measurement_column" and "timestamp_column" must be different`)
@@ -268,7 +268,7 @@ func (z *Zerobus) Connect() error {
 		applicationName += " " + name
 	}
 	sdkOptions := []sdkzerobus.Option{sdkzerobus.WithApplicationName(applicationName)}
-	if z.SchemaMode == schemaModeUnityCatalog {
+	if z.SchemaMode == schemaModeTableSchema {
 		if z.SchemaFetchTimeout > 0 {
 			sdkOptions = append(
 				sdkOptions,
@@ -369,8 +369,8 @@ func (z *Zerobus) openStream(ctx context.Context, clientSecret string) error {
 		stream ingestStream
 		err    error
 	)
-	if z.SchemaMode == schemaModeUnityCatalog {
-		stream, err = z.sdk.CreateUnityCatalogStream(
+	if z.SchemaMode == schemaModeTableSchema {
+		stream, err = z.sdk.CreateTableSchemaStream(
 			ctx,
 			z.TableName,
 			z.ClientID,
@@ -405,11 +405,11 @@ func (z *Zerobus) recreateStream() error {
 	}
 	_ = z.stream.Close()
 	z.stream = nil
-	if z.SchemaMode == schemaModeUnityCatalog {
+	if z.SchemaMode == schemaModeTableSchema {
 		if len(unacked) > 0 {
 			replay, chunkErr := z.chunkRecords(z.pending.replay)
 			if chunkErr != nil {
-				return fmt.Errorf("rebuilding Unity Catalog replay batches failed: %w", chunkErr)
+				return fmt.Errorf("rebuilding table-schema replay batches failed: %w", chunkErr)
 			}
 			z.pending.remaining = replay
 		}
@@ -532,8 +532,8 @@ func serializeMetrics(metrics []telegraf.Metric) ([][]byte, error) {
 }
 
 func (z *Zerobus) serializeMetrics(metrics []telegraf.Metric) ([][]byte, error) {
-	if z.SchemaMode == schemaModeUnityCatalog {
-		return serializeUnityCatalogMetrics(metrics, z.TimestampColumn, z.MeasurementColumn)
+	if z.SchemaMode == schemaModeTableSchema {
+		return serializeTableSchemaMetrics(metrics, z.TimestampColumn, z.MeasurementColumn)
 	}
 	return serializeMetrics(metrics)
 }
@@ -591,7 +591,7 @@ func messageDescriptor() ([]byte, error) {
 func init() {
 	outputs.Add("zerobus", func() telegraf.Output {
 		return &Zerobus{
-			SchemaMode:      schemaModeCanonical,
+			SchemaMode:      schemaModeStatic,
 			TimestampColumn: "timestamp",
 			ConnectTimeout:  config.Duration(defaultConnectTimeout),
 			MaxBatchRecords: defaultMaxBatchRecords,

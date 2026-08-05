@@ -9,16 +9,16 @@ import (
 	"github.com/influxdata/telegraf"
 )
 
-func serializeUnityCatalogMetrics(
+func serializeTableSchemaMetrics(
 	metrics []telegraf.Metric,
 	timestampColumn, measurementColumn string,
 ) ([][]byte, error) {
 	records := make([][]byte, 0, len(metrics))
 	for i, metric := range metrics {
-		record, err := metricToUnityCatalogJSON(metric, timestampColumn, measurementColumn)
+		record, err := metricToTableSchemaJSON(metric, timestampColumn, measurementColumn)
 		if err != nil {
 			return nil, fmt.Errorf(
-				"serializing metric %d (%q) for Unity Catalog schema failed: %w",
+				"serializing metric %d (%q) for table schema failed: %w",
 				i,
 				metric.Name(),
 				err,
@@ -29,7 +29,7 @@ func serializeUnityCatalogMetrics(
 	return records, nil
 }
 
-func metricToUnityCatalogJSON(
+func metricToTableSchemaJSON(
 	metric telegraf.Metric,
 	timestampColumn, measurementColumn string,
 ) ([]byte, error) {
@@ -46,7 +46,7 @@ func metricToUnityCatalogJSON(
 			return nil, fmt.Errorf("metric contains a nil tag")
 		}
 		if _, found := values[tag.Key]; found {
-			return nil, fmt.Errorf("tag %q conflicts with another Unity Catalog column", tag.Key)
+			return nil, fmt.Errorf("tag %q conflicts with another table column", tag.Key)
 		}
 		values[tag.Key] = tag.Value
 	}
@@ -56,7 +56,7 @@ func metricToUnityCatalogJSON(
 			return nil, fmt.Errorf("metric contains a nil field")
 		}
 		if _, found := values[field.Key]; found {
-			return nil, fmt.Errorf("field %q conflicts with another Unity Catalog column", field.Key)
+			return nil, fmt.Errorf("field %q conflicts with another table column", field.Key)
 		}
 		switch value := field.Value.(type) {
 		case int64, bool, string:
@@ -75,7 +75,7 @@ func metricToUnityCatalogJSON(
 
 	record, err := json.Marshal(values)
 	if err != nil {
-		return nil, fmt.Errorf("marshaling Unity Catalog JSON record failed: %w", err)
+		return nil, fmt.Errorf("marshaling table-schema JSON record failed: %w", err)
 	}
 	return record, nil
 }

@@ -34,7 +34,7 @@ func TestConnectAndWriteIntegration(t *testing.T) {
 	}
 	schemaMode := os.Getenv("ZEROBUS_SCHEMA_MODE")
 	if schemaMode == "" {
-		schemaMode = schemaModeCanonical
+		schemaMode = schemaModeStatic
 	}
 	timestampColumn := os.Getenv("ZEROBUS_TIMESTAMP_COLUMN")
 	if timestampColumn == "" {

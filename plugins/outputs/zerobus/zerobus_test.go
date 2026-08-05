@@ -30,7 +30,7 @@ func TestDefaults(t *testing.T) {
 	plugin, ok := creator().(*Zerobus)
 	require.True(t, ok)
 	require.Empty(t, plugin.ApplicationName)
-	require.Equal(t, schemaModeCanonical, plugin.SchemaMode)
+	require.Equal(t, schemaModeStatic, plugin.SchemaMode)
 	require.Equal(t, "timestamp", plugin.TimestampColumn)
 	require.Equal(t, config.Duration(defaultConnectTimeout), plugin.ConnectTimeout)
 	require.Equal(t, defaultMaxBatchRecords, plugin.MaxBatchRecords)
@@ -159,9 +159,9 @@ func TestInitRejectsInvalidTuning(t *testing.T) {
 func TestInitSchemaMode(t *testing.T) {
 	t.Run("normalizes mode", func(t *testing.T) {
 		plugin := validPlugin()
-		plugin.SchemaMode = " UNITY_CATALOG "
+		plugin.SchemaMode = " TABLE_SCHEMA "
 		require.NoError(t, plugin.Init())
-		require.Equal(t, schemaModeUnityCatalog, plugin.SchemaMode)
+		require.Equal(t, schemaModeTableSchema, plugin.SchemaMode)
 	})
 
 	t.Run("rejects unknown mode", func(t *testing.T) {
@@ -172,14 +172,14 @@ func TestInitSchemaMode(t *testing.T) {
 
 	t.Run("allows omitted timestamp column", func(t *testing.T) {
 		plugin := validPlugin()
-		plugin.SchemaMode = schemaModeUnityCatalog
+		plugin.SchemaMode = schemaModeTableSchema
 		plugin.TimestampColumn = ""
 		require.NoError(t, plugin.Init())
 	})
 
 	t.Run("rejects reserved column collision", func(t *testing.T) {
 		plugin := validPlugin()
-		plugin.SchemaMode = schemaModeUnityCatalog
+		plugin.SchemaMode = schemaModeTableSchema
 		plugin.MeasurementColumn = plugin.TimestampColumn
 		require.ErrorContains(t, plugin.Init(), "must be different")
 	})
@@ -261,7 +261,7 @@ func TestMetricToProtoPreservesTypesAndOrder(t *testing.T) {
 	require.Equal(t, "ready", record.Fields[4].GetStringValue())
 }
 
-func TestMetricToUnityCatalogJSONFlattensMetric(t *testing.T) {
+func TestMetricToTableSchemaJSONFlattensMetric(t *testing.T) {
 	input := metric.New(
 		"cpu",
 		map[string]string{"host": "server-01"},
@@ -275,7 +275,7 @@ func TestMetricToUnityCatalogJSONFlattensMetric(t *testing.T) {
 		time.Unix(1_700_000_000, 123_456_000),
 	)
 
-	record, err := metricToUnityCatalogJSON(input, "event_time", "measurement")
+	record, err := metricToTableSchemaJSON(input, "event_time", "measurement")
 	require.NoError(t, err)
 
 	var values map[string]json.RawMessage
@@ -289,7 +289,7 @@ func TestMetricToUnityCatalogJSONFlattensMetric(t *testing.T) {
 	require.JSONEq(t, `true`, string(values["active"]))
 	require.JSONEq(t, `"ready"`, string(values["status"]))
 
-	record, err = metricToUnityCatalogJSON(input, "", "")
+	record, err = metricToTableSchemaJSON(input, "", "")
 	require.NoError(t, err)
 	values = nil
 	require.NoError(t, json.Unmarshal(record, &values))
@@ -297,7 +297,7 @@ func TestMetricToUnityCatalogJSONFlattensMetric(t *testing.T) {
 	require.NotContains(t, values, "measurement")
 }
 
-func TestMetricToUnityCatalogJSONRejectsInvalidMetric(t *testing.T) {
+func TestMetricToTableSchemaJSONRejectsInvalidMetric(t *testing.T) {
 	tests := []struct {
 		name   string
 		metric telegraf.Metric
@@ -347,7 +347,7 @@ func TestMetricToUnityCatalogJSONRejectsInvalidMetric(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := metricToUnityCatalogJSON(tt.metric, "timestamp", "")
+			_, err := metricToTableSchemaJSON(tt.metric, "timestamp", "")
 			require.ErrorContains(t, err, tt.match)
 		})
 	}
@@ -409,11 +409,11 @@ func TestConnectPassesConfiguration(t *testing.T) {
 	require.Same(t, stream, plugin.stream)
 }
 
-func TestConnectCreatesUnityCatalogStream(t *testing.T) {
+func TestConnectCreatesTableSchemaStream(t *testing.T) {
 	stream := &fakeStream{}
 	sdk := &fakeSDK{stream: stream}
 	plugin := validPlugin()
-	plugin.SchemaMode = schemaModeUnityCatalog
+	plugin.SchemaMode = schemaModeTableSchema
 	plugin.SchemaFetchTimeout = config.Duration(5 * time.Second)
 	plugin.SchemaCacheTTL = config.Duration(-1)
 
@@ -427,7 +427,7 @@ func TestConnectCreatesUnityCatalogStream(t *testing.T) {
 	require.NoError(t, plugin.Connect())
 	require.Equal(t, 3, sdkOptionCount)
 	require.Zero(t, sdk.createCalls)
-	require.Equal(t, 1, sdk.unityCatalogCalls)
+	require.Equal(t, 1, sdk.tableSchemaCalls)
 	require.Len(t, sdk.options, 2)
 	require.Same(t, stream, plugin.stream)
 }
@@ -485,10 +485,10 @@ func TestWriteBatchesAndFlushesOnce(t *testing.T) {
 	require.Equal(t, "usage", first.Fields[0].GetKey())
 }
 
-func TestWriteUnityCatalogSchemaUsesJSON(t *testing.T) {
+func TestWriteTableSchemaUsesJSON(t *testing.T) {
 	stream := &fakeStream{}
 	plugin := validPlugin()
-	plugin.SchemaMode = schemaModeUnityCatalog
+	plugin.SchemaMode = schemaModeTableSchema
 	plugin.MeasurementColumn = "measurement"
 	plugin.stream = stream
 	input := metric.New(
@@ -761,13 +761,13 @@ func TestWriteReplaysOnlyUnacknowledgedRecordsAfterTerminalFailure(t *testing.T)
 	require.Nil(t, plugin.pending)
 }
 
-func TestWriteUnityCatalogSchemaReencodesRecordsAfterTerminalFailure(t *testing.T) {
+func TestWriteTableSchemaReencodesRecordsAfterTerminalFailure(t *testing.T) {
 	flushErr := errors.New("stream failed")
 	closed := &fakeStream{flushErrors: []error{flushErr}}
 	replacement := &fakeStream{}
 	sdk := &fakeSDK{stream: replacement}
 	plugin := validPlugin()
-	plugin.SchemaMode = schemaModeUnityCatalog
+	plugin.SchemaMode = schemaModeTableSchema
 	plugin.sdk = sdk
 	plugin.stream = closed
 	input := []telegraf.Metric{testutil.TestMetric(1)}
@@ -778,20 +778,20 @@ func TestWriteUnityCatalogSchemaReencodesRecordsAfterTerminalFailure(t *testing.
 	closed.closed = true
 
 	require.NoError(t, plugin.Write(input))
-	require.Equal(t, 1, sdk.unityCatalogCalls)
+	require.Equal(t, 1, sdk.tableSchemaCalls)
 	require.Equal(t, closed.batches[0], replacement.batches[0])
 	require.Equal(t, []bool{false}, replacement.encoded)
 	require.Nil(t, plugin.pending)
 }
 
-func TestWriteUnityCatalogSchemaReplaysOnlyCurrentSuffix(t *testing.T) {
+func TestWriteTableSchemaReplaysOnlyCurrentSuffix(t *testing.T) {
 	firstFlushErr := errors.New("first flush failed")
 	suffixFlushErr := errors.New("suffix flush failed")
 	closed := &fakeStream{flushErrors: []error{firstFlushErr, nil, suffixFlushErr}}
 	replacement := &fakeStream{}
 	sdk := &fakeSDK{stream: replacement}
 	plugin := validPlugin()
-	plugin.SchemaMode = schemaModeUnityCatalog
+	plugin.SchemaMode = schemaModeTableSchema
 	plugin.sdk = sdk
 	plugin.stream = closed
 	original := testutil.TestMetric(1)
@@ -803,7 +803,7 @@ func TestWriteUnityCatalogSchemaReplaysOnlyCurrentSuffix(t *testing.T) {
 	closed.closed = true
 
 	require.NoError(t, plugin.Write([]telegraf.Metric{original, added}))
-	expectedAdded, err := serializeUnityCatalogMetrics(
+	expectedAdded, err := serializeTableSchemaMetrics(
 		[]telegraf.Metric{added},
 		plugin.TimestampColumn,
 		plugin.MeasurementColumn,
@@ -872,7 +872,7 @@ func validPlugin() *Zerobus {
 		ClientID:        "client",
 		ClientSecret:    config.NewSecret([]byte("secret")),
 		ApplicationName: "telegraf",
-		SchemaMode:      schemaModeCanonical,
+		SchemaMode:      schemaModeStatic,
 		TimestampColumn: "timestamp",
 		ConnectTimeout:  config.Duration(defaultConnectTimeout),
 		MaxBatchRecords: defaultMaxBatchRecords,
@@ -936,19 +936,19 @@ func (s *fakeStream) Close() error {
 }
 
 type fakeSDK struct {
-	stream            ingestStream
-	streams           []ingestStream
-	createErr         error
-	createErrors      []error
-	closeErr          error
-	tableName         string
-	clientID          string
-	clientSecret      string
-	options           []sdkzerobus.StreamOption
-	contexts          []context.Context
-	createCalls       int
-	unityCatalogCalls int
-	closeCalls        int
+	stream           ingestStream
+	streams          []ingestStream
+	createErr        error
+	createErrors     []error
+	closeErr         error
+	tableName        string
+	clientID         string
+	clientSecret     string
+	options          []sdkzerobus.StreamOption
+	contexts         []context.Context
+	createCalls      int
+	tableSchemaCalls int
+	closeCalls       int
 }
 
 func (s *fakeSDK) CreateStream(
@@ -975,12 +975,12 @@ func (s *fakeSDK) CreateStream(
 	return s.stream, err
 }
 
-func (s *fakeSDK) CreateUnityCatalogStream(
+func (s *fakeSDK) CreateTableSchemaStream(
 	ctx context.Context,
 	tableName, clientID, clientSecret string,
 	options ...sdkzerobus.StreamOption,
 ) (ingestStream, error) {
-	s.unityCatalogCalls++
+	s.tableSchemaCalls++
 	s.tableName = tableName
 	s.clientID = clientID
 	s.clientSecret = clientSecret

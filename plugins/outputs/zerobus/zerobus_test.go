@@ -415,7 +415,6 @@ func TestConnectCreatesTableSchemaStream(t *testing.T) {
 	plugin := validPlugin()
 	plugin.SchemaMode = schemaModeTableSchema
 	plugin.SchemaFetchTimeout = config.Duration(5 * time.Second)
-	plugin.SchemaCacheTTL = config.Duration(-1)
 
 	var sdkOptionCount int
 	plugin.newSDK = func(_ string, _ string, options ...sdkzerobus.Option) (sdkClient, error) {
@@ -425,7 +424,7 @@ func TestConnectCreatesTableSchemaStream(t *testing.T) {
 
 	require.NoError(t, plugin.Init())
 	require.NoError(t, plugin.Connect())
-	require.Equal(t, 3, sdkOptionCount)
+	require.Equal(t, 2, sdkOptionCount)
 	require.Zero(t, sdk.createCalls)
 	require.Equal(t, 1, sdk.tableSchemaCalls)
 	require.Len(t, sdk.options, 2)

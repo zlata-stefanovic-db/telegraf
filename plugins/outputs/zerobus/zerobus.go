@@ -48,7 +48,6 @@ type Zerobus struct {
 	TimestampColumn    string          `toml:"timestamp_column"`
 	MeasurementColumn  string          `toml:"measurement_column"`
 	SchemaFetchTimeout config.Duration `toml:"schema_fetch_timeout"`
-	SchemaCacheTTL     config.Duration `toml:"schema_cache_ttl"`
 	ConnectTimeout     config.Duration `toml:"connect_timeout"`
 
 	MaxInflight             int             `toml:"max_inflight"`
@@ -135,11 +134,16 @@ func (s *sdkAdapter) CreateTableSchemaStream(
 	tableName, clientID, clientSecret string,
 	opts ...sdkzerobus.StreamOption,
 ) (ingestStream, error) {
-	stream, err := s.SDK.CreateDynamicProtoStream(ctx, tableName, clientID, clientSecret, opts...)
+	descriptor, err := s.SDK.FetchProtoDescriptorFromUC(ctx, tableName, clientID, clientSecret)
 	if err != nil {
 		return nil, err
 	}
-	return &tableSchemaStreamAdapter{DynamicProtoStream: stream}, nil
+	opts = append([]sdkzerobus.StreamOption{sdkzerobus.WithProto(descriptor)}, opts...)
+	stream, err := s.SDK.CreateStream(ctx, tableName, clientID, clientSecret, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return &tableSchemaStreamAdapter{Stream: stream}, nil
 }
 
 type staticStreamAdapter struct {
@@ -151,7 +155,7 @@ func (s *staticStreamAdapter) IngestRecordsOffset(records [][]byte, _ bool) (int
 }
 
 type tableSchemaStreamAdapter struct {
-	*sdkzerobus.DynamicProtoStream
+	*sdkzerobus.Stream
 }
 
 func (s *tableSchemaStreamAdapter) IngestRecordsOffset(
@@ -159,9 +163,9 @@ func (s *tableSchemaStreamAdapter) IngestRecordsOffset(
 	encoded bool,
 ) (int64, error) {
 	if encoded {
-		return s.DynamicProtoStream.Stream.IngestRecordsOffset(records)
+		return s.Stream.IngestRecordsOffset(records)
 	}
-	return s.DynamicProtoStream.IngestJSONRecordsOffset(records)
+	return s.Stream.IngestJSONRecordsOffset(records)
 }
 
 func (*Zerobus) SampleConfig() string {
@@ -281,13 +285,7 @@ func (z *Zerobus) Connect() error {
 		if z.SchemaFetchTimeout > 0 {
 			sdkOptions = append(
 				sdkOptions,
-				sdkzerobus.WithDynamicSchemaFetchTimeout(time.Duration(z.SchemaFetchTimeout)),
-			)
-		}
-		if z.SchemaCacheTTL != 0 {
-			sdkOptions = append(
-				sdkOptions,
-				sdkzerobus.WithDynamicSchemaCacheTTL(time.Duration(z.SchemaCacheTTL)),
+				sdkzerobus.WithProtoDescriptorFetchTimeout(time.Duration(z.SchemaFetchTimeout)),
 			)
 		}
 	}

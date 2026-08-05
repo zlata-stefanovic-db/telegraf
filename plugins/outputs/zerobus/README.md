@@ -66,9 +66,6 @@ See the [secret store documentation][SECRETSTORE] for details.
   ## Schema-fetch timeout; zero uses the SDK default.
   # schema_fetch_timeout = "0s"
 
-  ## Schema cache TTL; zero uses the default and negative disables caching.
-  # schema_cache_ttl = "0s"
-
   ## Unacknowledged ingest-call limit; zero uses the SDK default.
   # max_inflight = 0
 
@@ -148,9 +145,10 @@ field values to these supported types before outputs receive them.
 ### Table schema
 
 Set `schema_mode = "table_schema"` to fetch the destination table schema from
-Unity Catalog when the stream is created. The SDK builds a protobuf descriptor
-at runtime and converts each JSON record produced by the plugin to protobuf
-before admission.
+Unity Catalog before creating the stream. The SDK builds a protobuf descriptor,
+opens a regular protobuf stream with it, and converts each JSON record produced
+by the plugin to protobuf before admission. The SDK caches fetched descriptors
+for five minutes.
 
 Table-schema mode creates one flat record per metric:
 
@@ -174,7 +172,9 @@ must match its schema. Use Telegraf filtering or processors when separate
 measurements require different tables or column layouts. A tag, field, or
 configured metadata-column name collision is rejected before admission.
 Non-finite floats cannot be represented in the intermediate JSON and are also
-rejected.
+rejected. The SDK rejects table schemas containing nullable arrays or maps, or
+collections that allow null elements or values, because protobuf cannot
+preserve those distinctions.
 Unsigned integers are encoded as decimal strings to preserve the full `uint64`
 range, so their destination columns must be `STRING`.
 
@@ -195,8 +195,8 @@ The plugin retains admission progress after a failed `Write`. On retry it first
 confirms already admitted requests instead of admitting them again. If SDK
 recovery is exhausted, it creates a new stream. Static mode replays only
 records the SDK reports as unacknowledged. Table-schema mode re-encodes the
-pending portion from JSON against the newly fetched schema instead of replaying
-protobuf bytes that may use an obsolete descriptor.
+pending portion from JSON against the descriptor selected for the replacement
+stream instead of replaying protobuf bytes that may use an obsolete descriptor.
 
 Each individual serialized metric must fit within the configured payload
 and buffered-payload budgets. Larger Telegraf batches are split automatically.

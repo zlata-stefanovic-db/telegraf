@@ -17,7 +17,7 @@ message TelegrafMetric {
     required string key = 1;
     required string type = 2;
     optional int64 int_value = 3;
-    optional string uint_value = 4;
+    optional int64 uint_value = 4;
     optional double float_value = 5;
     optional bool bool_value = 6;
     optional string string_value = 7;

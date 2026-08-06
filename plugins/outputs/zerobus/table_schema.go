@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
-	"strconv"
 
 	"github.com/influxdata/telegraf"
 )
@@ -62,7 +61,15 @@ func metricToTableSchemaJSON(
 		case int64, bool, string:
 			values[field.Key] = value
 		case uint64:
-			values[field.Key] = strconv.FormatUint(value, 10)
+			if value > math.MaxInt64 {
+				return nil, fmt.Errorf(
+					"field %q contains uint64 value %d exceeding Delta BIGINT maximum %d",
+					field.Key,
+					value,
+					int64(math.MaxInt64),
+				)
+			}
+			values[field.Key] = int64(value)
 		case float64:
 			if math.IsNaN(value) || math.IsInf(value, 0) {
 				return nil, fmt.Errorf("field %q contains a non-finite float", field.Key)

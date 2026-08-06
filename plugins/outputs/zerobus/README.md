@@ -51,7 +51,8 @@ See the [secret store documentation][SECRETSTORE] for details.
   ## Optional measurement-name column for table_schema mode.
   # measurement_column = ""
 
-  ## In table_schema mode, uint64 columns must be STRING.
+  ## In table_schema mode, uint64 columns must be BIGINT. Values above the
+  ## BIGINT maximum are unsupported.
 
   ## OAuth service-principal credentials.
   client_id = ""
@@ -115,7 +116,7 @@ CREATE TABLE catalog.schema.telegraf_metrics (
     key: STRING NOT NULL,
     type: STRING NOT NULL,
     int_value: BIGINT,
-    uint_value: STRING,
+    uint_value: BIGINT,
     float_value: DOUBLE,
     bool_value: BOOLEAN,
     string_value: STRING
@@ -128,13 +129,12 @@ rename, remove, or change the nullability of these columns. Compatible future
 schema revisions will only add nullable fields with new protobuf field numbers.
 
 `timestamp_ns` is a raw Unix nanosecond `BIGINT`, not a Delta `TIMESTAMP`.
-Unsigned integers use decimal strings because protobuf `uint64` has no
-lossless Delta numeric mapping over its full range.
 
 ### Field mapping
 
 - `int64` becomes `type = "int"` and `int_value`.
-- `uint64` becomes `type = "uint"` and a decimal `uint_value`.
+- `uint64` values through `math.MaxInt64` become `type = "uint"` and
+  `uint_value`; larger values are rejected.
 - `float64` becomes `type = "float"` and `float_value`.
 - `bool` becomes `type = "bool"` and `bool_value`.
 - `string` becomes `type = "string"` and `string_value`.
@@ -175,8 +175,13 @@ Non-finite floats cannot be represented in the intermediate JSON and are also
 rejected. The SDK rejects table schemas containing nullable arrays or maps, or
 collections that allow null elements or values, because protobuf cannot
 preserve those distinctions.
-Unsigned integers are encoded as decimal strings to preserve the full `uint64`
-range, so their destination columns must be `STRING`.
+
+Telegraf field types are preserved where they have a lossless Delta
+representation. Recommended Delta columns are `BIGINT` for `int64`, `DOUBLE`
+for `float64`, `BOOLEAN` for `bool`, and `STRING` for `string`. The schema does
+not support the full `uint64` range: destination columns for `uint64` fields
+must be `BIGINT`, and values above the `BIGINT` maximum are unsupported and
+rejected.
 
 ## Batching and durability
 

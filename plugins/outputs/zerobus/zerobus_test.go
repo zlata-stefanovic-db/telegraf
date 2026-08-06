@@ -228,7 +228,7 @@ func TestMetricToProtoPreservesTypesAndOrder(t *testing.T) {
 		map[string]string{"host": "server-01", "region": "west"},
 		map[string]interface{}{
 			"z-string": "ready",
-			"b-uint":   uint64(math.MaxUint64),
+			"b-uint":   uint64(math.MaxInt64),
 			"d-bool":   true,
 			"a-int":    int64(-42),
 			"c-float":  1.25,
@@ -252,7 +252,7 @@ func TestMetricToProtoPreservesTypesAndOrder(t *testing.T) {
 	require.Equal(t, int64(-42), record.Fields[0].GetIntValue())
 	require.Nil(t, record.Fields[0].UintValue)
 	require.Equal(t, "uint", record.Fields[1].GetType())
-	require.Equal(t, "18446744073709551615", record.Fields[1].GetUintValue())
+	require.Equal(t, int64(math.MaxInt64), record.Fields[1].GetUintValue())
 	require.Equal(t, "float", record.Fields[2].GetType())
 	require.Equal(t, 1.25, record.Fields[2].GetFloatValue())
 	require.Equal(t, "bool", record.Fields[3].GetType())
@@ -270,7 +270,7 @@ func TestMetricToTableSchemaJSONFlattensMetric(t *testing.T) {
 			"count":  int64(-42),
 			"ratio":  1.25,
 			"status": "ready",
-			"total":  uint64(math.MaxUint64),
+			"total":  uint64(math.MaxInt64),
 		},
 		time.Unix(1_700_000_000, 123_456_000),
 	)
@@ -284,7 +284,7 @@ func TestMetricToTableSchemaJSONFlattensMetric(t *testing.T) {
 	require.JSONEq(t, `"server-01"`, string(values["host"]))
 	require.JSONEq(t, `1700000000123456`, string(values["event_time"]))
 	require.JSONEq(t, `-42`, string(values["count"]))
-	require.JSONEq(t, `"18446744073709551615"`, string(values["total"]))
+	require.JSONEq(t, `9223372036854775807`, string(values["total"]))
 	require.JSONEq(t, `1.25`, string(values["ratio"]))
 	require.JSONEq(t, `true`, string(values["active"]))
 	require.JSONEq(t, `"ready"`, string(values["status"]))
@@ -334,6 +334,16 @@ func TestMetricToTableSchemaJSONRejectsInvalidMetric(t *testing.T) {
 			match: "non-finite float",
 		},
 		{
+			name: "uint64 above BIGINT maximum",
+			metric: metric.New(
+				"cpu",
+				nil,
+				map[string]interface{}{"value": uint64(math.MaxInt64) + 1},
+				time.Now(),
+			),
+			match: "exceeding Delta BIGINT maximum",
+		},
+		{
 			name: "unsupported field",
 			metric: metricWithFields{
 				Metric: testutil.TestMetric(1),
@@ -356,6 +366,11 @@ func TestMetricToTableSchemaJSONRejectsInvalidMetric(t *testing.T) {
 func TestFieldToProtoRejectsUnsupportedValue(t *testing.T) {
 	_, err := fieldToProto(&telegraf.Field{Key: "invalid", Value: []int{1}})
 	require.ErrorContains(t, err, "unsupported field type []int")
+}
+
+func TestFieldToProtoRejectsUint64AboveBigintMaximum(t *testing.T) {
+	_, err := fieldToProto(&telegraf.Field{Key: "value", Value: uint64(math.MaxInt64) + 1})
+	require.ErrorContains(t, err, "exceeds Delta BIGINT maximum")
 }
 
 func TestMetricToProtoRejectsNilField(t *testing.T) {

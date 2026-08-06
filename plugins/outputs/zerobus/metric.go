@@ -3,8 +3,8 @@ package zerobus
 import (
 	"cmp"
 	"fmt"
+	"math"
 	"slices"
-	"strconv"
 
 	"google.golang.org/protobuf/proto"
 
@@ -52,8 +52,11 @@ func fieldToProto(field *telegraf.Field) (*TelegrafMetric_FieldValue, error) {
 		value.Type = proto.String("int")
 		value.IntValue = proto.Int64(v)
 	case uint64:
+		if v > math.MaxInt64 {
+			return nil, fmt.Errorf("uint64 value %d exceeds Delta BIGINT maximum %d", v, int64(math.MaxInt64))
+		}
 		value.Type = proto.String("uint")
-		value.UintValue = proto.String(strconv.FormatUint(v, 10))
+		value.UintValue = proto.Int64(int64(v))
 	case float64:
 		value.Type = proto.String("float")
 		value.FloatValue = proto.Float64(v)

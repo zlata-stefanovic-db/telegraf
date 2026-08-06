@@ -97,7 +97,7 @@ type TelegrafMetric_FieldValue struct {
 	Key           *string                `protobuf:"bytes,1,req,name=key" json:"key,omitempty"`
 	Type          *string                `protobuf:"bytes,2,req,name=type" json:"type,omitempty"`
 	IntValue      *int64                 `protobuf:"varint,3,opt,name=int_value,json=intValue" json:"int_value,omitempty"`
-	UintValue     *string                `protobuf:"bytes,4,opt,name=uint_value,json=uintValue" json:"uint_value,omitempty"`
+	UintValue     *int64                 `protobuf:"varint,4,opt,name=uint_value,json=uintValue" json:"uint_value,omitempty"`
 	FloatValue    *float64               `protobuf:"fixed64,5,opt,name=float_value,json=floatValue" json:"float_value,omitempty"`
 	BoolValue     *bool                  `protobuf:"varint,6,opt,name=bool_value,json=boolValue" json:"bool_value,omitempty"`
 	StringValue   *string                `protobuf:"bytes,7,opt,name=string_value,json=stringValue" json:"string_value,omitempty"`
@@ -156,11 +156,11 @@ func (x *TelegrafMetric_FieldValue) GetIntValue() int64 {
 	return 0
 }
 
-func (x *TelegrafMetric_FieldValue) GetUintValue() string {
+func (x *TelegrafMetric_FieldValue) GetUintValue() int64 {
 	if x != nil && x.UintValue != nil {
 		return *x.UintValue
 	}
-	return ""
+	return 0
 }
 
 func (x *TelegrafMetric_FieldValue) GetFloatValue() float64 {
@@ -203,7 +203,7 @@ const file_metric_proto_rawDesc = "" +
 	"\x04type\x18\x02 \x02(\tR\x04type\x12\x1b\n" +
 	"\tint_value\x18\x03 \x01(\x03R\bintValue\x12\x1d\n" +
 	"\n" +
-	"uint_value\x18\x04 \x01(\tR\tuintValue\x12\x1f\n" +
+	"uint_value\x18\x04 \x01(\x03R\tuintValue\x12\x1f\n" +
 	"\vfloat_value\x18\x05 \x01(\x01R\n" +
 	"floatValue\x12\x1d\n" +
 	"\n" +

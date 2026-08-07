@@ -1,7 +1,7 @@
 # Zerobus Output Plugin
 
 This plugin writes metrics to a Unity Catalog Delta table using the
-[Databricks Zerobus Ingest][zerobus] service and its pure-Go SDK. It supports a
+[Databricks Zerobus Ingest][zerobus] service and its Go SDK. It supports a
 static schema that stores arbitrary metrics in a fixed envelope and an opt-in
 table-schema mode that derives the protobuf schema from the destination table.
 

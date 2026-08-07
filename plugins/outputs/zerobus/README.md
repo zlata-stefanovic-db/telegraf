@@ -171,8 +171,12 @@ A `::` cast fails the query when a value cannot be converted. Use
 Set `schema_mode = "table_schema"` to fetch the destination table schema from
 Unity Catalog before creating the stream. The SDK builds a protobuf descriptor,
 opens a regular protobuf stream with it, and converts each JSON record produced
-by the plugin to protobuf before admission. The SDK caches fetched descriptors
-for five minutes.
+by the plugin to protobuf before admission.
+
+The descriptor is reused when a failed stream is replaced, keeping the Unity
+Catalog round-trip off the recovery path. If the replacement stream also fails,
+the next one refetches the schema, so a changed table schema recovers without
+restarting Telegraf.
 
 Table-schema mode creates one flat record per metric:
 

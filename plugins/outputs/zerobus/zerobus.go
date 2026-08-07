@@ -62,11 +62,13 @@ type Zerobus struct {
 	LackOfAckTimeout        config.Duration `toml:"lack_of_ack_timeout"`
 	FlushTimeout            config.Duration `toml:"flush_timeout"`
 
-	sdk       sdkClient
-	stream    ingestStream
-	newSDK    sdkFactory
-	pending   *pendingWrite
-	confirmed [][]byte
+	sdk              sdkClient
+	stream           ingestStream
+	newSDK           sdkFactory
+	pending          *pendingWrite
+	confirmed        [][]byte
+	descriptor       []byte
+	descriptorReused bool
 }
 
 // Interface for the ingest stream.
@@ -112,6 +114,10 @@ type sdkClient interface {
 		tableName, clientID, clientSecret string,
 		opts ...sdkzerobus.StreamOption,
 	) (ingestStream, error)
+	FetchProtoDescriptor(
+		ctx context.Context,
+		tableName, clientID, clientSecret string,
+	) ([]byte, error)
 	Close() error
 }
 
@@ -146,19 +152,20 @@ func (s *sdkAdapter) CreateTableSchemaStream(
 	tableName, clientID, clientSecret string,
 	opts ...sdkzerobus.StreamOption,
 ) (ingestStream, error) {
-	// Fetch the protobuf descriptor from the Unity Catalog.
-	descriptor, err := s.SDK.FetchProtoDescriptorFromUC(ctx, tableName, clientID, clientSecret)
-	if err != nil {
-		return nil, err
-	}
-	// Add the protobuf descriptor to the stream options.
-	opts = append([]sdkzerobus.StreamOption{sdkzerobus.WithProto(descriptor)}, opts...)
 	// Create a stream.
 	stream, err := s.SDK.CreateStream(ctx, tableName, clientID, clientSecret, opts...)
 	if err != nil {
 		return nil, err
 	}
 	return &tableSchemaStreamAdapter{Stream: stream}, nil
+}
+
+// Fetch the table's protobuf descriptor from Unity Catalog.
+func (s *sdkAdapter) FetchProtoDescriptor(
+	ctx context.Context,
+	tableName, clientID, clientSecret string,
+) ([]byte, error) {
+	return s.SDK.FetchProtoDescriptorFromUC(ctx, tableName, clientID, clientSecret)
 }
 
 // Adapter for the static schema stream.
@@ -417,6 +424,9 @@ func (z *Zerobus) Close() error {
 	// Clear the pending and confirmed metrics.
 	z.pending = nil
 	z.confirmed = nil
+	// Clear the cached descriptor.
+	z.descriptor = nil
+	z.descriptorReused = false
 	// Close the SDK client.
 	if z.sdk != nil {
 		sdkErr = z.sdk.Close()
@@ -436,6 +446,22 @@ func (z *Zerobus) openStream(ctx context.Context, clientSecret string) error {
 	)
 	// Create a table schema stream if the schema mode is table schema.
 	if z.SchemaMode == schemaModeTableSchema {
+		// Fetch the descriptor unless a reusable one is already cached.
+		if z.descriptor == nil {
+			descriptor, fetchErr := z.sdk.FetchProtoDescriptor(
+				ctx,
+				z.TableName,
+				z.ClientID,
+				clientSecret,
+			)
+			if fetchErr != nil {
+				return fetchErr
+			}
+			z.descriptor = descriptor
+			z.descriptorReused = false
+		}
+		// Add the protobuf descriptor to the stream options.
+		options = append([]sdkzerobus.StreamOption{sdkzerobus.WithProto(z.descriptor)}, options...)
 		stream, err = z.sdk.CreateTableSchemaStream(
 			ctx,
 			z.TableName,
@@ -480,6 +506,7 @@ func (z *Zerobus) recreateStream() error {
 	z.stream = nil
 	// If the schema mode is table schema, rebuild the table schema replay batches.
 	if z.SchemaMode == schemaModeTableSchema {
+		z.ageDescriptor()
 		if len(unacked) > len(z.pending.admitted) {
 			return fmt.Errorf("rebuilding table-schema replay batches failed: SDK returned %d unacknowledged batches for %d admitted batches", len(unacked), len(z.pending.admitted))
 		}
@@ -503,6 +530,21 @@ func (z *Zerobus) recreateStream() error {
 	z.pending.waiting = false
 
 	return z.openStreamFromSecret()
+}
+
+// Decide whether the cached descriptor survives the next stream. The first
+// recreation reuses it, since a stream usually fails for reasons unrelated to
+// the schema. A second recreation without an intervening successful flush
+// discards it, so the replacement stream refetches a possibly changed schema.
+func (z *Zerobus) ageDescriptor() {
+	switch {
+	case z.descriptor == nil:
+	case z.descriptorReused:
+		z.descriptor = nil
+		z.descriptorReused = false
+	default:
+		z.descriptorReused = true
+	}
 }
 
 // Open a stream from the client secret.
@@ -571,6 +613,8 @@ func (z *Zerobus) processPending() error {
 			return z.writeError("flushing batch", err)
 		}
 	}
+	// The stream accepted records, so the descriptor it opened with is current.
+	z.descriptorReused = false
 	// Reset the pending metrics.
 	z.pending = nil
 	return nil

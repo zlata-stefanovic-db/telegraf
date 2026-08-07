@@ -462,7 +462,9 @@ func TestConnectCreatesTableSchemaStream(t *testing.T) {
 	require.Equal(t, 2, sdkOptionCount)
 	require.Zero(t, sdk.staticSchemaCalls)
 	require.Equal(t, 1, sdk.tableSchemaCalls)
-	require.Len(t, sdk.options, 2)
+	require.Equal(t, 1, sdk.fetchCalls)
+	require.Len(t, sdk.options, 3)
+	require.Equal(t, []byte("descriptor"), plugin.descriptor)
 	require.Same(t, stream, plugin.stream)
 }
 
@@ -821,6 +823,80 @@ func TestWriteTableSchemaReencodesRecordsAfterTerminalFailure(t *testing.T) {
 	require.Nil(t, plugin.pending)
 }
 
+func TestWriteTableSchemaReusesDescriptorForReplacementStream(t *testing.T) {
+	flushErr := errors.New("stream failed")
+	closed := &fakeStream{flushErrors: []error{flushErr}}
+	replacement := &fakeStream{}
+	sdk := &fakeSDK{stream: replacement, descriptors: [][]byte{[]byte("first")}}
+	plugin := validPlugin()
+	plugin.SchemaMode = schemaModeTableSchema
+	plugin.sdk = sdk
+	plugin.stream = closed
+	plugin.descriptor = []byte("first")
+	input := []telegraf.Metric{testutil.TestMetric(1)}
+
+	require.ErrorIs(t, plugin.Write(input), flushErr)
+	closed.unacked = [][][]byte{{{0x08, 0x01}}}
+	closed.closed = true
+
+	require.NoError(t, plugin.Write(input))
+	require.Equal(t, 1, sdk.tableSchemaCalls)
+	require.Same(t, replacement, plugin.stream)
+	require.Zero(t, sdk.fetchCalls)
+	require.Equal(t, []byte("first"), plugin.descriptor)
+	require.False(t, plugin.descriptorReused)
+}
+
+func TestWriteTableSchemaRefetchesDescriptorAfterReusedStreamFails(t *testing.T) {
+	firstErr := errors.New("first stream failed")
+	secondErr := errors.New("reused descriptor failed")
+	closed := &fakeStream{flushErrors: []error{firstErr}}
+	reused := &fakeStream{flushErrors: []error{secondErr}}
+	refetched := &fakeStream{}
+	sdk := &fakeSDK{
+		streams:     []ingestStream{reused, refetched},
+		descriptors: [][]byte{[]byte("second")},
+	}
+	plugin := validPlugin()
+	plugin.SchemaMode = schemaModeTableSchema
+	plugin.sdk = sdk
+	plugin.stream = closed
+	plugin.descriptor = []byte("first")
+	input := []telegraf.Metric{testutil.TestMetric(1)}
+
+	require.ErrorIs(t, plugin.Write(input), firstErr)
+	closed.unacked = [][][]byte{{{0x08, 0x01}}}
+	closed.closed = true
+
+	require.ErrorIs(t, plugin.Write(input), secondErr)
+	require.Equal(t, 1, sdk.tableSchemaCalls)
+	require.Same(t, reused, plugin.stream)
+	require.Zero(t, sdk.fetchCalls)
+	require.True(t, plugin.descriptorReused)
+	reused.unacked = [][][]byte{{{0x08, 0x01}}}
+	reused.closed = true
+
+	require.NoError(t, plugin.Write(input))
+	require.Equal(t, 2, sdk.tableSchemaCalls)
+	require.Same(t, refetched, plugin.stream)
+	require.Equal(t, 1, sdk.fetchCalls)
+	require.Equal(t, []byte("second"), plugin.descriptor)
+	require.False(t, plugin.descriptorReused)
+}
+
+func TestCloseClearsCachedDescriptor(t *testing.T) {
+	plugin := validPlugin()
+	plugin.SchemaMode = schemaModeTableSchema
+	plugin.sdk = &fakeSDK{}
+	plugin.stream = &fakeStream{}
+	plugin.descriptor = []byte("descriptor")
+	plugin.descriptorReused = true
+
+	require.NoError(t, plugin.Close())
+	require.Nil(t, plugin.descriptor)
+	require.False(t, plugin.descriptorReused)
+}
+
 func TestWriteTableSchemaReplaysOnlyCurrentSuffix(t *testing.T) {
 	firstFlushErr := errors.New("first flush failed")
 	suffixFlushErr := errors.New("suffix flush failed")
@@ -1076,6 +1152,9 @@ type fakeSDK struct {
 	staticSchemaCalls int
 	tableSchemaCalls  int
 	closeCalls        int
+	descriptors       [][]byte
+	descriptorErr     error
+	fetchCalls        int
 }
 
 func (s *fakeSDK) CreateStaticSchemaStream(
@@ -1124,6 +1203,24 @@ func (s *fakeSDK) CreateTableSchemaStream(
 		return stream, err
 	}
 	return s.stream, err
+}
+
+func (s *fakeSDK) FetchProtoDescriptor(
+	_ context.Context,
+	_, _, _ string,
+) ([]byte, error) {
+	s.fetchCalls++
+	if s.descriptorErr != nil {
+		return nil, s.descriptorErr
+	}
+	if len(s.descriptors) == 0 {
+		return []byte("descriptor"), nil
+	}
+	descriptor := s.descriptors[0]
+	if len(s.descriptors) > 1 {
+		s.descriptors = s.descriptors[1:]
+	}
+	return descriptor, nil
 }
 
 func (s *fakeSDK) Close() error {

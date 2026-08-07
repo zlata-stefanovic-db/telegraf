@@ -25,6 +25,7 @@ import (
 //go:embed sample.conf
 var sampleConfig string
 
+// Default values.
 const (
 	defaultMaxBatchRecords  = 100_000
 	defaultMaxPayloadBytes  = 10*1024*1024 - 64*1024
@@ -36,6 +37,7 @@ const (
 	schemaModeTableSchema   = "table_schema"
 )
 
+// Zerobus output plugin configuration.
 type Zerobus struct {
 	ServerEndpoint  string        `toml:"zerobus_server_endpoint"`
 	WorkspaceURL    string        `toml:"workspace_url"`
@@ -67,6 +69,7 @@ type Zerobus struct {
 	confirmed [][]byte
 }
 
+// Interface for the ingest stream.
 type ingestStream interface {
 	IngestRecordsOffset(records [][]byte, encoded bool) (int64, error)
 	Flush() error
@@ -75,6 +78,7 @@ type ingestStream interface {
 	Close() error
 }
 
+// Struct for the pending write.
 type pendingWrite struct {
 	original  [][]byte
 	admitted  []recordBatch
@@ -82,11 +86,13 @@ type pendingWrite struct {
 	waiting   bool
 }
 
+// Struct for the record batch.
 type recordBatch struct {
 	records [][]byte
 	encoded bool
 }
 
+// Struct for the prepared write.
 type preparedWrite struct {
 	records      [][]byte
 	accept       []int
@@ -94,8 +100,9 @@ type preparedWrite struct {
 	rejectErrors []error
 }
 
+// Interface for the SDK client.
 type sdkClient interface {
-	CreateStream(
+	CreateStaticSchemaStream(
 		ctx context.Context,
 		tableName, clientID, clientSecret string,
 		opts ...sdkzerobus.StreamOption,
@@ -108,20 +115,24 @@ type sdkClient interface {
 	Close() error
 }
 
+// Factory function for the SDK client.
 type sdkFactory func(
 	serverEndpoint, workspaceURL string,
 	opts ...sdkzerobus.Option,
 ) (sdkClient, error)
 
+// Adapter for the SDK client.
 type sdkAdapter struct {
 	*sdkzerobus.SDK
 }
 
-func (s *sdkAdapter) CreateStream(
+// Create a stream with the static schema descriptor.
+func (s *sdkAdapter) CreateStaticSchemaStream(
 	ctx context.Context,
 	tableName, clientID, clientSecret string,
 	opts ...sdkzerobus.StreamOption,
 ) (ingestStream, error) {
+	// Create a stream.
 	stream, err := s.SDK.CreateStream(ctx, tableName, clientID, clientSecret, opts...)
 	if err != nil {
 		return nil, err
@@ -129,16 +140,20 @@ func (s *sdkAdapter) CreateStream(
 	return &staticStreamAdapter{Stream: stream}, nil
 }
 
+// Create a stream with the table schema descriptor.
 func (s *sdkAdapter) CreateTableSchemaStream(
 	ctx context.Context,
 	tableName, clientID, clientSecret string,
 	opts ...sdkzerobus.StreamOption,
 ) (ingestStream, error) {
+	// Fetch the protobuf descriptor from the Unity Catalog.
 	descriptor, err := s.SDK.FetchProtoDescriptorFromUC(ctx, tableName, clientID, clientSecret)
 	if err != nil {
 		return nil, err
 	}
+	// Add the protobuf descriptor to the stream options.
 	opts = append([]sdkzerobus.StreamOption{sdkzerobus.WithProto(descriptor)}, opts...)
+	// Create a stream.
 	stream, err := s.SDK.CreateStream(ctx, tableName, clientID, clientSecret, opts...)
 	if err != nil {
 		return nil, err
@@ -146,18 +161,22 @@ func (s *sdkAdapter) CreateTableSchemaStream(
 	return &tableSchemaStreamAdapter{Stream: stream}, nil
 }
 
+// Adapter for the static schema stream.
 type staticStreamAdapter struct {
 	*sdkzerobus.Stream
 }
 
+// Wrap the IngestRecordsOffset method for static schema mode.
 func (s *staticStreamAdapter) IngestRecordsOffset(records [][]byte, _ bool) (int64, error) {
 	return s.Stream.IngestRecordsOffset(records)
 }
 
+// Adapter for the table schema stream.
 type tableSchemaStreamAdapter struct {
 	*sdkzerobus.Stream
 }
 
+// Wrap the IngestRecordsOffset method for table schema mode.
 func (s *tableSchemaStreamAdapter) IngestRecordsOffset(
 	records [][]byte,
 	encoded bool,
@@ -168,6 +187,7 @@ func (s *tableSchemaStreamAdapter) IngestRecordsOffset(
 	return s.Stream.IngestJSONRecordsOffset(records)
 }
 
+// Return the sample configuration to fit the plugin interface.
 func (*Zerobus) SampleConfig() string {
 	return sampleConfig
 }
@@ -431,7 +451,7 @@ func (z *Zerobus) openStream(ctx context.Context, clientSecret string) error {
 		}
 		// Add the protobuf descriptor to the stream options.
 		options = append([]sdkzerobus.StreamOption{sdkzerobus.WithProto(descriptor)}, options...)
-		stream, err = z.sdk.CreateStream(
+		stream, err = z.sdk.CreateStaticSchemaStream(
 			ctx,
 			z.TableName,
 			z.ClientID,

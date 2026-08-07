@@ -460,7 +460,7 @@ func TestConnectCreatesTableSchemaStream(t *testing.T) {
 	require.NoError(t, plugin.Init())
 	require.NoError(t, plugin.Connect())
 	require.Equal(t, 2, sdkOptionCount)
-	require.Zero(t, sdk.createCalls)
+	require.Zero(t, sdk.staticSchemaCalls)
 	require.Equal(t, 1, sdk.tableSchemaCalls)
 	require.Len(t, sdk.options, 2)
 	require.Same(t, stream, plugin.stream)
@@ -745,7 +745,7 @@ func TestWriteRecreatesTerminalStream(t *testing.T) {
 	require.NoError(t, plugin.Write([]telegraf.Metric{testutil.TestMetric(1)}))
 	require.Equal(t, 1, closed.unackedCalls)
 	require.Equal(t, 1, closed.closeCalls)
-	require.Equal(t, 1, sdk.createCalls)
+	require.Equal(t, 1, sdk.staticSchemaCalls)
 	require.Equal(t, 1, replacement.ingestCalls)
 	require.Equal(t, 1, replacement.flushCalls)
 	require.Same(t, replacement, plugin.stream)
@@ -770,7 +770,7 @@ func TestWriteRetriesFailedStreamRecreation(t *testing.T) {
 
 	require.NoError(t, plugin.Write(input))
 	require.Same(t, replacement, plugin.stream)
-	require.Equal(t, 2, sdk.createCalls)
+	require.Equal(t, 2, sdk.staticSchemaCalls)
 	require.Equal(t, 1, replacement.ingestCalls)
 	require.Nil(t, plugin.pending)
 }
@@ -1063,27 +1063,27 @@ func (s *fakeStream) Close() error {
 }
 
 type fakeSDK struct {
-	stream           ingestStream
-	streams          []ingestStream
-	createErr        error
-	createErrors     []error
-	closeErr         error
-	tableName        string
-	clientID         string
-	clientSecret     string
-	options          []sdkzerobus.StreamOption
-	contexts         []context.Context
-	createCalls      int
-	tableSchemaCalls int
-	closeCalls       int
+	stream            ingestStream
+	streams           []ingestStream
+	createErr         error
+	createErrors      []error
+	closeErr          error
+	tableName         string
+	clientID          string
+	clientSecret      string
+	options           []sdkzerobus.StreamOption
+	contexts          []context.Context
+	staticSchemaCalls int
+	tableSchemaCalls  int
+	closeCalls        int
 }
 
-func (s *fakeSDK) CreateStream(
+func (s *fakeSDK) CreateStaticSchemaStream(
 	ctx context.Context,
 	tableName, clientID, clientSecret string,
 	options ...sdkzerobus.StreamOption,
 ) (ingestStream, error) {
-	s.createCalls++
+	s.staticSchemaCalls++
 	s.tableName = tableName
 	s.clientID = clientID
 	s.clientSecret = clientSecret

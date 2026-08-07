@@ -375,8 +375,7 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 		z.confirmed = nil
 		return prepared.result()
 	}
-	// Store the original records.
-	// This is used to restore the original records if the ingestion fails.
+	// Store the original records for retry if the ingestion fails.
 	original := records
 
 	// If there are confirmed metrics, check if the new metrics have the same prefix.
@@ -533,9 +532,7 @@ func (z *Zerobus) recreateStream() error {
 }
 
 // Decide whether the cached descriptor survives the next stream. The first
-// recreation reuses it, since a stream usually fails for reasons unrelated to
-// the schema. A second recreation without an intervening successful flush
-// discards it, so the replacement stream refetches a possibly changed schema.
+// recreation reuses it and the second recreation discards it.
 func (z *Zerobus) ageDescriptor() {
 	switch {
 	case z.descriptor == nil:

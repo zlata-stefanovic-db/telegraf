@@ -201,27 +201,19 @@ func TestMessageDescriptor(t *testing.T) {
 	require.Equal(t, int32(2), descriptor.Field[1].GetNumber())
 	require.Equal(t, "tags", descriptor.Field[2].GetName())
 	require.Equal(t, "fields", descriptor.Field[3].GetName())
+	require.Equal(t, descriptorpb.FieldDescriptorProto_TYPE_STRING, descriptor.Field[3].GetType())
+	require.Equal(t, descriptorpb.FieldDescriptorProto_LABEL_REQUIRED, descriptor.Field[3].GetLabel())
+
+	require.Len(t, descriptor.NestedType, 1)
 	require.Equal(
 		t,
-		".telegraf.zerobus.v1.TelegrafMetric.FieldValue",
-		descriptor.Field[3].GetTypeName(),
+		"TagsEntry",
+		descriptor.NestedType[0].GetName(),
+		"tags must be nested so the descriptor is self-contained",
 	)
-
-	var fieldValue *descriptorpb.DescriptorProto
-	for _, nested := range descriptor.NestedType {
-		if nested.GetName() == "FieldValue" {
-			fieldValue = nested
-			break
-		}
-	}
-	require.NotNil(t, fieldValue, "FieldValue must be nested so the descriptor is self-contained")
-	require.Len(t, fieldValue.Field, 7)
-	require.Equal(t, "key", fieldValue.Field[0].GetName())
-	require.Equal(t, descriptorpb.FieldDescriptorProto_LABEL_REQUIRED, fieldValue.Field[0].GetLabel())
-	require.Equal(t, "string_value", fieldValue.Field[6].GetName())
 }
 
-func TestMetricToProtoPreservesTypesAndOrder(t *testing.T) {
+func TestMetricToProtoEncodesFieldsAsVariantJSON(t *testing.T) {
 	timestamp := time.Unix(1_700_000_000, 123)
 	input := metric.New(
 		"cpu",
@@ -241,24 +233,31 @@ func TestMetricToProtoPreservesTypesAndOrder(t *testing.T) {
 	require.Equal(t, "cpu", record.GetMeasurement())
 	require.Equal(t, timestamp.UnixNano(), record.GetTimestampNs())
 	require.Equal(t, map[string]string{"host": "server-01", "region": "west"}, record.GetTags())
+	require.JSONEq(
+		t,
+		`{"a-int":-42,"b-uint":9223372036854775807,"c-float":1.25,"d-bool":true,`+
+			`"z-string":"ready"}`,
+		record.GetFields(),
+	)
+}
 
-	keys := make([]string, 0, len(record.Fields))
-	for _, field := range record.Fields {
-		keys = append(keys, field.GetKey())
-	}
-	require.Equal(t, []string{"a-int", "b-uint", "c-float", "d-bool", "z-string"}, keys)
+func TestMetricFieldsJSONSortsKeys(t *testing.T) {
+	input := metric.New(
+		"cpu",
+		nil,
+		map[string]interface{}{"z": int64(1), "a": int64(2), "m": int64(3)},
+		time.Unix(1, 0),
+	)
 
-	require.Equal(t, "int", record.Fields[0].GetType())
-	require.Equal(t, int64(-42), record.Fields[0].GetIntValue())
-	require.Nil(t, record.Fields[0].UintValue)
-	require.Equal(t, "uint", record.Fields[1].GetType())
-	require.Equal(t, int64(math.MaxInt64), record.Fields[1].GetUintValue())
-	require.Equal(t, "float", record.Fields[2].GetType())
-	require.Equal(t, 1.25, record.Fields[2].GetFloatValue())
-	require.Equal(t, "bool", record.Fields[3].GetType())
-	require.True(t, record.Fields[3].GetBoolValue())
-	require.Equal(t, "string", record.Fields[4].GetType())
-	require.Equal(t, "ready", record.Fields[4].GetStringValue())
+	fields, err := metricFieldsJSON(input)
+	require.NoError(t, err)
+	require.Equal(t, `{"a":2,"m":3,"z":1}`, string(fields))
+}
+
+func TestMetricToProtoAcceptsMetricWithoutFields(t *testing.T) {
+	record, err := metricToProto(metric.New("cpu", nil, nil, time.Unix(1, 0)))
+	require.NoError(t, err)
+	require.Equal(t, "{}", record.GetFields())
 }
 
 func TestMetricToTableSchemaJSONFlattensMetric(t *testing.T) {
@@ -363,14 +362,35 @@ func TestMetricToTableSchemaJSONRejectsInvalidMetric(t *testing.T) {
 	}
 }
 
-func TestFieldToProtoRejectsUnsupportedValue(t *testing.T) {
-	_, err := fieldToProto(&telegraf.Field{Key: "invalid", Value: []int{1}})
-	require.ErrorContains(t, err, "unsupported field type []int")
-}
+func TestFieldToVariantRejectsInvalidValues(t *testing.T) {
+	tests := []struct {
+		name  string
+		field *telegraf.Field
+		match string
+	}{
+		{
+			name:  "unsupported type",
+			field: &telegraf.Field{Key: "invalid", Value: []int{1}},
+			match: "unsupported field type []int",
+		},
+		{
+			name:  "uint64 above BIGINT maximum",
+			field: &telegraf.Field{Key: "value", Value: uint64(math.MaxInt64) + 1},
+			match: "exceeds Delta BIGINT maximum",
+		},
+		{
+			name:  "non-finite float",
+			field: &telegraf.Field{Key: "value", Value: math.Inf(1)},
+			match: "non-finite float",
+		},
+	}
 
-func TestFieldToProtoRejectsUint64AboveBigintMaximum(t *testing.T) {
-	_, err := fieldToProto(&telegraf.Field{Key: "value", Value: uint64(math.MaxInt64) + 1})
-	require.ErrorContains(t, err, "exceeds Delta BIGINT maximum")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := fieldToVariant(tt.field)
+			require.ErrorContains(t, err, tt.match)
+		})
+	}
 }
 
 func TestMetricToProtoRejectsNilField(t *testing.T) {
@@ -496,7 +516,7 @@ func TestWriteBatchesAndFlushesOnce(t *testing.T) {
 	var first TelegrafMetric
 	require.NoError(t, proto.Unmarshal(stream.records[0], &first))
 	require.Equal(t, "cpu", first.GetMeasurement())
-	require.Equal(t, "usage", first.Fields[0].GetKey())
+	require.JSONEq(t, `{"usage":1.5}`, first.GetFields())
 }
 
 func TestWriteTableSchemaUsesJSON(t *testing.T) {
@@ -634,9 +654,9 @@ func TestWriteAdmitsOnlyNewSuffixOnAugmentedRetry(t *testing.T) {
 	require.Equal(t, 2, stream.ingestCalls)
 	require.Len(t, stream.batches, 2)
 
-	expectedAdded, err := serializeMetrics([]telegraf.Metric{added})
+	expectedAdded, err := serializeStaticMetric(added)
 	require.NoError(t, err)
-	require.Equal(t, expectedAdded, stream.batches[1])
+	require.Equal(t, [][]byte{expectedAdded}, stream.batches[1])
 	require.Equal(t, 3, stream.flushCalls)
 }
 
@@ -658,9 +678,9 @@ func TestWritePreservesCumulativeIdentityAcrossSuffixFailure(t *testing.T) {
 
 	require.Equal(t, 2, stream.ingestCalls)
 	require.Len(t, stream.batches, 2)
-	expectedAdded, err := serializeMetrics([]telegraf.Metric{added})
+	expectedAdded, err := serializeStaticMetric(added)
 	require.NoError(t, err)
-	require.Equal(t, expectedAdded, stream.batches[1])
+	require.Equal(t, [][]byte{expectedAdded}, stream.batches[1])
 	require.Equal(t, 4, stream.flushCalls)
 	require.Nil(t, plugin.pending)
 }
@@ -689,9 +709,9 @@ func TestWriteReturnsPartialErrorAfterPendingWriteSucceeds(t *testing.T) {
 
 	require.NoError(t, plugin.Write([]telegraf.Metric{added}))
 	require.Equal(t, 2, stream.ingestCalls)
-	expectedAdded, err := serializeMetrics([]telegraf.Metric{added})
+	expectedAdded, err := serializeStaticMetric(added)
 	require.NoError(t, err)
-	require.Equal(t, expectedAdded, stream.batches[1])
+	require.Equal(t, [][]byte{expectedAdded}, stream.batches[1])
 	require.Nil(t, plugin.confirmed)
 }
 
@@ -820,13 +840,13 @@ func TestWriteTableSchemaReplaysOnlyCurrentSuffix(t *testing.T) {
 	closed.closed = true
 
 	require.NoError(t, plugin.Write([]telegraf.Metric{original, added}))
-	expectedAdded, err := serializeTableSchemaMetrics(
-		[]telegraf.Metric{added},
+	expectedAdded, err := metricToTableSchemaJSON(
+		added,
 		plugin.TimestampColumn,
 		plugin.MeasurementColumn,
 	)
 	require.NoError(t, err)
-	require.Equal(t, expectedAdded, replacement.batches[0])
+	require.Equal(t, [][]byte{expectedAdded}, replacement.batches[0])
 	require.Equal(t, []bool{false}, replacement.encoded)
 }
 
@@ -890,7 +910,7 @@ func TestWriteRejectsInvalidMetricWithoutBlockingValidMetrics(t *testing.T) {
 }
 
 func TestWriteRejectsMetricExceedingBufferedPayloadLimit(t *testing.T) {
-	record, err := serializeMetric(testutil.TestMetric(1))
+	record, err := serializeStaticMetric(testutil.TestMetric(1))
 	require.NoError(t, err)
 	recordSize := protowire.SizeTag(1) + protowire.SizeBytes(len(record))
 
@@ -909,13 +929,13 @@ func TestWriteRejectsMetricExceedingBufferedPayloadLimit(t *testing.T) {
 
 func TestWriteSplitsBatchByPayloadSize(t *testing.T) {
 	input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
-	records, err := serializeMetrics(input)
+	first, err := serializeStaticMetric(input[0])
 	require.NoError(t, err)
 
 	stream := &fakeStream{}
 	plugin := validPlugin()
 	plugin.MaxPayloadBytes = config.Size(
-		batchEnvelopeReserve + protowire.SizeTag(1) + protowire.SizeBytes(len(records[0])),
+		batchEnvelopeReserve + protowire.SizeTag(1) + protowire.SizeBytes(len(first)),
 	)
 	plugin.stream = stream
 
@@ -929,10 +949,12 @@ func TestWriteSplitsBatchByPayloadSize(t *testing.T) {
 
 func TestWriteSplitsBatchByBufferedPayloadSize(t *testing.T) {
 	input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
-	records, err := serializeMetrics(input)
+	first, err := serializeStaticMetric(input[0])
 	require.NoError(t, err)
-	firstSize := protowire.SizeTag(1) + protowire.SizeBytes(len(records[0]))
-	secondSize := protowire.SizeTag(1) + protowire.SizeBytes(len(records[1]))
+	second, err := serializeStaticMetric(input[1])
+	require.NoError(t, err)
+	firstSize := protowire.SizeTag(1) + protowire.SizeBytes(len(first))
+	secondSize := protowire.SizeTag(1) + protowire.SizeBytes(len(second))
 
 	stream := &fakeStream{}
 	plugin := validPlugin()

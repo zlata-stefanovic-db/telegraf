@@ -24,11 +24,12 @@ const (
 // TelegrafMetric maps one metric to a Delta row. Field numbers match column
 // order.
 type TelegrafMetric struct {
-	state         protoimpl.MessageState       `protogen:"open.v1"`
-	Measurement   *string                      `protobuf:"bytes,1,req,name=measurement" json:"measurement,omitempty"`
-	TimestampNs   *int64                       `protobuf:"varint,2,req,name=timestamp_ns,json=timestampNs" json:"timestamp_ns,omitempty"`
-	Tags          map[string]string            `protobuf:"bytes,3,rep,name=tags" json:"tags,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
-	Fields        []*TelegrafMetric_FieldValue `protobuf:"bytes,4,rep,name=fields" json:"fields,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	Measurement *string                `protobuf:"bytes,1,req,name=measurement" json:"measurement,omitempty"`
+	TimestampNs *int64                 `protobuf:"varint,2,req,name=timestamp_ns,json=timestampNs" json:"timestamp_ns,omitempty"`
+	Tags        map[string]string      `protobuf:"bytes,3,rep,name=tags" json:"tags,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	// JSON object holding the metric fields; Zerobus stores it as VARIANT.
+	Fields        *string `protobuf:"bytes,4,req,name=fields" json:"fields,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -84,102 +85,9 @@ func (x *TelegrafMetric) GetTags() map[string]string {
 	return nil
 }
 
-func (x *TelegrafMetric) GetFields() []*TelegrafMetric_FieldValue {
-	if x != nil {
-		return x.Fields
-	}
-	return nil
-}
-
-// FieldValue stores one typed field; exactly one value is set.
-type TelegrafMetric_FieldValue struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           *string                `protobuf:"bytes,1,req,name=key" json:"key,omitempty"`
-	Type          *string                `protobuf:"bytes,2,req,name=type" json:"type,omitempty"`
-	IntValue      *int64                 `protobuf:"varint,3,opt,name=int_value,json=intValue" json:"int_value,omitempty"`
-	UintValue     *int64                 `protobuf:"varint,4,opt,name=uint_value,json=uintValue" json:"uint_value,omitempty"`
-	FloatValue    *float64               `protobuf:"fixed64,5,opt,name=float_value,json=floatValue" json:"float_value,omitempty"`
-	BoolValue     *bool                  `protobuf:"varint,6,opt,name=bool_value,json=boolValue" json:"bool_value,omitempty"`
-	StringValue   *string                `protobuf:"bytes,7,opt,name=string_value,json=stringValue" json:"string_value,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *TelegrafMetric_FieldValue) Reset() {
-	*x = TelegrafMetric_FieldValue{}
-	mi := &file_metric_proto_msgTypes[2]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *TelegrafMetric_FieldValue) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*TelegrafMetric_FieldValue) ProtoMessage() {}
-
-func (x *TelegrafMetric_FieldValue) ProtoReflect() protoreflect.Message {
-	mi := &file_metric_proto_msgTypes[2]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use TelegrafMetric_FieldValue.ProtoReflect.Descriptor instead.
-func (*TelegrafMetric_FieldValue) Descriptor() ([]byte, []int) {
-	return file_metric_proto_rawDescGZIP(), []int{0, 1}
-}
-
-func (x *TelegrafMetric_FieldValue) GetKey() string {
-	if x != nil && x.Key != nil {
-		return *x.Key
-	}
-	return ""
-}
-
-func (x *TelegrafMetric_FieldValue) GetType() string {
-	if x != nil && x.Type != nil {
-		return *x.Type
-	}
-	return ""
-}
-
-func (x *TelegrafMetric_FieldValue) GetIntValue() int64 {
-	if x != nil && x.IntValue != nil {
-		return *x.IntValue
-	}
-	return 0
-}
-
-func (x *TelegrafMetric_FieldValue) GetUintValue() int64 {
-	if x != nil && x.UintValue != nil {
-		return *x.UintValue
-	}
-	return 0
-}
-
-func (x *TelegrafMetric_FieldValue) GetFloatValue() float64 {
-	if x != nil && x.FloatValue != nil {
-		return *x.FloatValue
-	}
-	return 0
-}
-
-func (x *TelegrafMetric_FieldValue) GetBoolValue() bool {
-	if x != nil && x.BoolValue != nil {
-		return *x.BoolValue
-	}
-	return false
-}
-
-func (x *TelegrafMetric_FieldValue) GetStringValue() string {
-	if x != nil && x.StringValue != nil {
-		return *x.StringValue
+func (x *TelegrafMetric) GetFields() string {
+	if x != nil && x.Fields != nil {
+		return *x.Fields
 	}
 	return ""
 }
@@ -188,27 +96,15 @@ var File_metric_proto protoreflect.FileDescriptor
 
 const file_metric_proto_rawDesc = "" +
 	"\n" +
-	"\fmetric.proto\x12\x13telegraf.zerobus.v1\"\xed\x03\n" +
+	"\fmetric.proto\x12\x13telegraf.zerobus.v1\"\xe9\x01\n" +
 	"\x0eTelegrafMetric\x12 \n" +
 	"\vmeasurement\x18\x01 \x02(\tR\vmeasurement\x12!\n" +
 	"\ftimestamp_ns\x18\x02 \x02(\x03R\vtimestampNs\x12A\n" +
-	"\x04tags\x18\x03 \x03(\v2-.telegraf.zerobus.v1.TelegrafMetric.TagsEntryR\x04tags\x12F\n" +
-	"\x06fields\x18\x04 \x03(\v2..telegraf.zerobus.v1.TelegrafMetric.FieldValueR\x06fields\x1a7\n" +
+	"\x04tags\x18\x03 \x03(\v2-.telegraf.zerobus.v1.TelegrafMetric.TagsEntryR\x04tags\x12\x16\n" +
+	"\x06fields\x18\x04 \x02(\tR\x06fields\x1a7\n" +
 	"\tTagsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\x1a\xd1\x01\n" +
-	"\n" +
-	"FieldValue\x12\x10\n" +
-	"\x03key\x18\x01 \x02(\tR\x03key\x12\x12\n" +
-	"\x04type\x18\x02 \x02(\tR\x04type\x12\x1b\n" +
-	"\tint_value\x18\x03 \x01(\x03R\bintValue\x12\x1d\n" +
-	"\n" +
-	"uint_value\x18\x04 \x01(\x03R\tuintValue\x12\x1f\n" +
-	"\vfloat_value\x18\x05 \x01(\x01R\n" +
-	"floatValue\x12\x1d\n" +
-	"\n" +
-	"bool_value\x18\x06 \x01(\bR\tboolValue\x12!\n" +
-	"\fstring_value\x18\a \x01(\tR\vstringValueB8Z6github.com/influxdata/telegraf/plugins/outputs/zerobus"
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01B8Z6github.com/influxdata/telegraf/plugins/outputs/zerobus"
 
 var (
 	file_metric_proto_rawDescOnce sync.Once
@@ -222,20 +118,18 @@ func file_metric_proto_rawDescGZIP() []byte {
 	return file_metric_proto_rawDescData
 }
 
-var file_metric_proto_msgTypes = make([]protoimpl.MessageInfo, 3)
+var file_metric_proto_msgTypes = make([]protoimpl.MessageInfo, 2)
 var file_metric_proto_goTypes = []any{
-	(*TelegrafMetric)(nil),            // 0: telegraf.zerobus.v1.TelegrafMetric
-	nil,                               // 1: telegraf.zerobus.v1.TelegrafMetric.TagsEntry
-	(*TelegrafMetric_FieldValue)(nil), // 2: telegraf.zerobus.v1.TelegrafMetric.FieldValue
+	(*TelegrafMetric)(nil), // 0: telegraf.zerobus.v1.TelegrafMetric
+	nil,                    // 1: telegraf.zerobus.v1.TelegrafMetric.TagsEntry
 }
 var file_metric_proto_depIdxs = []int32{
 	1, // 0: telegraf.zerobus.v1.TelegrafMetric.tags:type_name -> telegraf.zerobus.v1.TelegrafMetric.TagsEntry
-	2, // 1: telegraf.zerobus.v1.TelegrafMetric.fields:type_name -> telegraf.zerobus.v1.TelegrafMetric.FieldValue
-	2, // [2:2] is the sub-list for method output_type
-	2, // [2:2] is the sub-list for method input_type
-	2, // [2:2] is the sub-list for extension type_name
-	2, // [2:2] is the sub-list for extension extendee
-	0, // [0:2] is the sub-list for field type_name
+	1, // [1:1] is the sub-list for method output_type
+	1, // [1:1] is the sub-list for method input_type
+	1, // [1:1] is the sub-list for extension type_name
+	1, // [1:1] is the sub-list for extension extendee
+	0, // [0:1] is the sub-list for field type_name
 }
 
 func init() { file_metric_proto_init() }
@@ -249,7 +143,7 @@ func file_metric_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_metric_proto_rawDesc), len(file_metric_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   3,
+			NumMessages:   2,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

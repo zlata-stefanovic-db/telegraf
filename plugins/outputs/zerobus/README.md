@@ -2,8 +2,8 @@
 
 This plugin writes metrics to a Unity Catalog Delta table using the
 [Databricks Zerobus Ingest][zerobus] service and its pure-Go SDK. It supports a
-static protobuf schema and an opt-in table-schema mode that derives the
-protobuf schema from the destination table.
+static schema that stores arbitrary metrics in a fixed envelope and an opt-in
+table-schema mode that derives the protobuf schema from the destination table.
 
 ⭐ Telegraf v1.40.0
 🏷️ cloud, datastore
@@ -40,8 +40,8 @@ See the [secret store documentation][SECRETSTORE] for details.
   ## Fully qualified Unity Catalog destination table.
   table_name = "catalog.schema.telegraf_metrics"
 
-  ## Schema mode: static uses TelegrafMetric; table_schema maps tags and
-  ## fields to columns from the destination table schema.
+  ## Schema mode: static stores fields in a VARIANT column; table_schema maps
+  ## tags and fields to columns from the destination table schema.
   # schema_mode = "static"
 
   ## Optional timestamp column for table_schema mode, encoded as Unix
@@ -51,8 +51,8 @@ See the [secret store documentation][SECRETSTORE] for details.
   ## Optional measurement-name column for table_schema mode.
   # measurement_column = ""
 
-  ## In table_schema mode, uint64 columns must be BIGINT. Values above the
-  ## BIGINT maximum are unsupported.
+  ## uint64 fields require BIGINT columns; values above the BIGINT maximum are
+  ## unsupported.
 
   ## OAuth service-principal credentials.
   client_id = ""
@@ -105,22 +105,15 @@ metrics are written.
 ### Static schema
 
 Static mode is the default. It uses one fixed protobuf record per Telegraf
-metric. Create the destination table with this exact schema and column order:
+metric, with the metric fields in a `VARIANT` column. Create the destination
+table with this exact schema and column order:
 
 ```sql
 CREATE TABLE catalog.schema.telegraf_metrics (
   measurement STRING NOT NULL,
   timestamp_ns BIGINT NOT NULL,
   tags MAP<STRING, STRING> NOT NULL,
-  fields ARRAY<STRUCT<
-    key: STRING NOT NULL,
-    type: STRING NOT NULL,
-    int_value: BIGINT,
-    uint_value: BIGINT,
-    float_value: DOUBLE,
-    bool_value: BOOLEAN,
-    string_value: STRING
-  >> NOT NULL
+  fields VARIANT NOT NULL
 );
 ```
 
@@ -132,15 +125,29 @@ schema revisions will only add nullable fields with new protobuf field numbers.
 
 ### Field mapping
 
-- `int64` becomes `type = "int"` and `int_value`.
-- `uint64` values through `math.MaxInt64` become `type = "uint"` and
-  `uint_value`; larger values are rejected.
-- `float64` becomes `type = "float"` and `float_value`.
-- `bool` becomes `type = "bool"` and `bool_value`.
-- `string` becomes `type = "string"` and `string_value`.
+All fields of a metric become one JSON object in the `fields` `VARIANT` column,
+which Zerobus transports as a protobuf string. Field names and types therefore can be changed without altering the destination table.
 
-Exactly one value member is populated for each field. Telegraf normalizes input
-field values to these supported types before outputs receive them.
+- `int64` becomes a JSON number.
+- `uint64` values through `math.MaxInt64` become JSON numbers; larger values
+  are rejected because Delta cannot represent the full `uint64` range.
+- `float64` becomes a JSON number; non-finite values such as `NaN` are rejected
+  because JSON cannot represent them.
+- `bool` becomes a JSON boolean.
+- `string` becomes a JSON string.
+
+Telegraf normalizes input field values to these supported types before outputs
+receive them. Variant keeps the JSON type of each value rather than the
+Telegraf type, so a float with an integral value is stored as an integer. Cast
+on read:
+
+```sql
+SELECT
+  measurement,
+  tags['host'] AS host,
+  fields:usage_idle::double AS usage_idle
+FROM catalog.schema.telegraf_metrics;
+```
 
 ### Table schema
 

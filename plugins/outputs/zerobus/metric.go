@@ -1,30 +1,38 @@
 package zerobus
 
 import (
-	"cmp"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
-	"slices"
 
 	"google.golang.org/protobuf/proto"
 
 	"github.com/influxdata/telegraf"
 )
 
+// Converts a Telegraf Metric into a protobuf message.
 func metricToProto(metric telegraf.Metric) (*TelegrafMetric, error) {
-	fields := slices.Clone(metric.FieldList())
-	for _, field := range fields {
+	fields, err := metricFieldsJSON(metric)
+	if err != nil {
+		return nil, err
+	}
+	return &TelegrafMetric{
+		Measurement: proto.String(metric.Name()),
+		TimestampNs: proto.Int64(metric.Time().UnixNano()),
+		Tags:        metric.Tags(),
+		Fields:      proto.String(string(fields)),
+	}, nil
+}
+
+// Turns the fields of the Telegraf Metric into a JSON string.
+func metricFieldsJSON(metric telegraf.Metric) ([]byte, error) {
+	values := make(map[string]interface{}, len(metric.FieldList()))
+	for _, field := range metric.FieldList() {
 		if field == nil {
 			return nil, fmt.Errorf("metric %q contains a nil field", metric.Name())
 		}
-	}
-	slices.SortFunc(fields, func(a, b *telegraf.Field) int {
-		return cmp.Compare(a.Key, b.Key)
-	})
-
-	values := make([]*TelegrafMetric_FieldValue, 0, len(fields))
-	for _, field := range fields {
-		value, err := fieldToProto(field)
+		value, err := fieldToVariant(field)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"converting field %q of metric %q failed: %w",
@@ -33,42 +41,40 @@ func metricToProto(metric telegraf.Metric) (*TelegrafMetric, error) {
 				err,
 			)
 		}
-		values = append(values, value)
+		values[field.Key] = value
 	}
 
-	return &TelegrafMetric{
-		Measurement: proto.String(metric.Name()),
-		TimestampNs: proto.Int64(metric.Time().UnixNano()),
-		Tags:        metric.Tags(),
-		Fields:      values,
-	}, nil
+	// Marshaling a map sorts the keys, so equal metrics produce equal records.
+	fields, err := json.Marshal(values)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling fields of metric %q failed: %w", metric.Name(), err)
+	}
+	return fields, nil
 }
 
-func fieldToProto(field *telegraf.Field) (*TelegrafMetric_FieldValue, error) {
-	value := &TelegrafMetric_FieldValue{Key: proto.String(field.Key)}
-
-	switch v := field.Value.(type) {
-	case int64:
-		value.Type = proto.String("int")
-		value.IntValue = proto.Int64(v)
+// Converts one field to a variant encoding.
+func fieldToVariant(field *telegraf.Field) (interface{}, error) {
+	switch value := field.Value.(type) {
+	// The types that are supported by the VARIANT column.
+	case int64, bool, string:
+		return value, nil
+	// The uint64 type is encoded as a Delta BIGINT.
 	case uint64:
-		if v > math.MaxInt64 {
-			return nil, fmt.Errorf("uint64 value %d exceeds Delta BIGINT maximum %d", v, int64(math.MaxInt64))
+		if value > math.MaxInt64 {
+			return nil, fmt.Errorf(
+				"uint64 value %d exceeds Delta BIGINT maximum %d",
+				value,
+				int64(math.MaxInt64),
+			)
 		}
-		value.Type = proto.String("uint")
-		value.UintValue = proto.Int64(int64(v))
+		return int64(value), nil
+	// The float64 type is encoded as a DOUBLE.
 	case float64:
-		value.Type = proto.String("float")
-		value.FloatValue = proto.Float64(v)
-	case bool:
-		value.Type = proto.String("bool")
-		value.BoolValue = proto.Bool(v)
-	case string:
-		value.Type = proto.String("string")
-		value.StringValue = proto.String(v)
+		if math.IsNaN(value) || math.IsInf(value, 0) {
+			return nil, errors.New("non-finite float cannot be represented in JSON")
+		}
+		return value, nil
 	default:
 		return nil, fmt.Errorf("unsupported field type %T", field.Value)
 	}
-
-	return value, nil
 }

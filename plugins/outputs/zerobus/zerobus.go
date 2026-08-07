@@ -172,13 +172,17 @@ func (*Zerobus) SampleConfig() string {
 	return sampleConfig
 }
 
+// Initialize the Zerobus output plugin.
 func (z *Zerobus) Init() error {
+	// Convert the schema mode to lowercase and trim whitespaces.
 	z.SchemaMode = strings.ToLower(strings.TrimSpace(z.SchemaMode))
 	z.TimestampColumn = strings.TrimSpace(z.TimestampColumn)
 	z.MeasurementColumn = strings.TrimSpace(z.MeasurementColumn)
+	// Use static schema mode by default.
 	if z.SchemaMode == "" {
 		z.SchemaMode = schemaModeStatic
 	}
+	// Validate the schema mode.
 	if z.SchemaMode != schemaModeStatic && z.SchemaMode != schemaModeTableSchema {
 		return fmt.Errorf(
 			`option "schema_mode" must be %q or %q`,
@@ -186,12 +190,13 @@ func (z *Zerobus) Init() error {
 			schemaModeTableSchema,
 		)
 	}
+	// Validate the measurement and timestamp columns in table schema mode.
 	if z.SchemaMode == schemaModeTableSchema &&
 		z.MeasurementColumn != "" &&
 		z.MeasurementColumn == z.TimestampColumn {
 		return errors.New(`options "measurement_column" and "timestamp_column" must be different`)
 	}
-
+	// Validate the required configurations.
 	requiredStrings := []struct {
 		name  string
 		value string
@@ -254,6 +259,7 @@ func (z *Zerobus) Init() error {
 		}
 	}
 
+	// Create a new SDK if one is not already set.
 	if z.newSDK == nil {
 		z.newSDK = func(
 			serverEndpoint, workspaceURL string,
@@ -269,6 +275,7 @@ func (z *Zerobus) Init() error {
 	return nil
 }
 
+// Connect to the Zerobus server.
 func (z *Zerobus) Connect() error {
 	secret, err := z.ClientSecret.Get()
 	if err != nil {
@@ -289,15 +296,19 @@ func (z *Zerobus) Connect() error {
 			)
 		}
 	}
+	// Create a new SDK client.
 	sdk, err := z.newSDK(z.ServerEndpoint, z.WorkspaceURL, sdkOptions...)
 	if err != nil {
 		return fmt.Errorf("creating Zerobus SDK failed: %w", err)
 	}
-
 	z.sdk = sdk
+
+	// Create a context with a timeout for the connection.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(z.ConnectTimeout))
 	defer cancel()
+	// Open a stream to the Zerobus server.
 	if err := z.openStream(ctx, secret.String()); err != nil {
+		// If the stream creation fails, close the SDK client and return an error.
 		z.sdk = nil
 		startupErr := &internal.StartupError{
 			Err:   fmt.Errorf("creating Zerobus stream failed: %w", err),
@@ -309,6 +320,7 @@ func (z *Zerobus) Connect() error {
 	return nil
 }
 
+// Write the metrics to the Zerobus server.
 func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
@@ -317,24 +329,36 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 		return internal.ErrNotConnected
 	}
 
+	// If there are pending metrics, try to ingest them again.
 	if z.pending != nil {
 		pendingOriginal := z.pending.original
+		// If the pending metrics cannot be ingested, return an error.
 		if err := z.processPending(); err != nil {
 			return err
 		}
+		// If the pending metrics were ingested successfully, clear the confirmed metrics.
 		z.confirmed = pendingOriginal
 	}
 
+	// Prepare the metrics for the Zerobus server.
 	prepared := z.prepareMetrics(metrics)
 	records := prepared.records
 	if len(records) == 0 {
+		// If there are no metrics to ingest, clear the confirmed metrics and return the result.
 		z.confirmed = nil
 		return prepared.result()
 	}
+	// Store the original records.
+	// This is used to restore the original records if the ingestion fails.
 	original := records
+
+	// If there are confirmed metrics, check if the new metrics have the same prefix.
 	if z.confirmed != nil {
+		// Check if the new metrics contain the already confirmed metrics.
 		if recordsHavePrefix(records, z.confirmed) {
+			// Remove the confirmed metrics.
 			records = records[len(z.confirmed):]
+			// If there is nothing to ingest return the ingestion result.
 			if len(records) == 0 {
 				z.confirmed = nil
 				return prepared.result()
@@ -344,6 +368,7 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 		}
 	}
 
+	// Chunk the records into smaller batches.
 	chunks, err := z.chunkRecords(records)
 	if err != nil {
 		return err
@@ -353,33 +378,43 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 		remaining: chunks,
 	}
 	z.confirmed = nil
+	// Try to ingest the pending metrics.
 	if err := z.processPending(); err != nil {
 		return err
 	}
+	// Return the result of the ingestion.
 	return prepared.result()
 }
 
+// Close the Zerobus connection.
 func (z *Zerobus) Close() error {
+	// Close the stream.
 	var streamErr, sdkErr error
 	if z.stream != nil {
 		streamErr = z.stream.Close()
 		z.stream = nil
 	}
+	// Clear the pending and confirmed metrics.
 	z.pending = nil
 	z.confirmed = nil
+	// Close the SDK client.
 	if z.sdk != nil {
 		sdkErr = z.sdk.Close()
 		z.sdk = nil
 	}
+	// Return the errors from the stream and SDK client.
 	return errors.Join(streamErr, sdkErr)
 }
 
+// Open a stream to the Zerobus server.
 func (z *Zerobus) openStream(ctx context.Context, clientSecret string) error {
+	// Get the stream options.
 	options := z.streamOptions()
 	var (
 		stream ingestStream
 		err    error
 	)
+	// Create a table schema stream if the schema mode is table schema.
 	if z.SchemaMode == schemaModeTableSchema {
 		stream, err = z.sdk.CreateTableSchemaStream(
 			ctx,
@@ -389,10 +424,12 @@ func (z *Zerobus) openStream(ctx context.Context, clientSecret string) error {
 			options...,
 		)
 	} else {
+		// Create a static schema stream if the schema mode is static.
 		descriptor, descriptorErr := messageDescriptor()
 		if descriptorErr != nil {
 			return fmt.Errorf("building protobuf descriptor failed: %w", descriptorErr)
 		}
+		// Add the protobuf descriptor to the stream options.
 		options = append([]sdkzerobus.StreamOption{sdkzerobus.WithProto(descriptor)}, options...)
 		stream, err = z.sdk.CreateStream(
 			ctx,
@@ -409,98 +446,126 @@ func (z *Zerobus) openStream(ctx context.Context, clientSecret string) error {
 	return nil
 }
 
+// Recreate the stream.
 func (z *Zerobus) recreateStream() error {
+	// Get the unacknowledged batches.
 	unacked, err := z.stream.GetUnackedBatches()
+	// If the unacknowledged batches cannot be retrieved, return an error.
 	if err != nil {
 		return z.writeError("retrieving unacknowledged batches", err)
 	}
+	// Close the stream.
 	_ = z.stream.Close()
+	// Clear the stream.
 	z.stream = nil
+	// If the schema mode is table schema, rebuild the table schema replay batches.
 	if z.SchemaMode == schemaModeTableSchema {
 		if len(unacked) > len(z.pending.admitted) {
-			return fmt.Errorf(
-				"rebuilding table-schema replay batches failed: SDK returned %d "+
-					"unacknowledged batches for %d admitted batches",
-				len(unacked),
-				len(z.pending.admitted),
-			)
+			return fmt.Errorf("rebuilding table-schema replay batches failed: SDK returned %d unacknowledged batches for %d admitted batches", len(unacked), len(z.pending.admitted))
 		}
+		// If there are unacknowledged batches, rebuild the table schema replay batches.
 		if len(unacked) > 0 {
 			start := len(z.pending.admitted) - len(unacked)
 			replay := slices.Clone(z.pending.admitted[start:])
 			z.pending.remaining = append(replay, z.pending.remaining...)
 		}
 	} else {
+		// If the schema mode is static, rebuild the static schema replay batches.
 		replay := make([]recordBatch, 0, len(unacked)+len(z.pending.remaining))
 		for _, batch := range unacked {
 			replay = append(replay, recordBatch{records: batch, encoded: true})
 		}
 		z.pending.remaining = append(replay, z.pending.remaining...)
 	}
+	// Clear the admitted batches.
 	z.pending.admitted = nil
+	// Reset the waiting flag.
 	z.pending.waiting = false
 
 	return z.openStreamFromSecret()
 }
 
+// Open a stream from the client secret.
 func (z *Zerobus) openStreamFromSecret() error {
+	// Get the client secret.
 	secret, err := z.ClientSecret.Get()
 	if err != nil {
 		return fmt.Errorf("resolving client secret for stream recovery failed: %w", err)
 	}
 	defer secret.Destroy()
+	// Create a context with a timeout for the connection.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(z.ConnectTimeout))
 	defer cancel()
+	// Open a stream to the Zerobus server.
 	if err := z.openStream(ctx, secret.String()); err != nil {
 		return z.writeError("recreating stream", err)
 	}
 	return nil
 }
 
+// Process the pending metrics.
 func (z *Zerobus) processPending() error {
+	// If the stream is nil, open a new stream.
 	if z.stream == nil {
 		if err := z.openStreamFromSecret(); err != nil {
 			return err
 		}
-	} else if z.stream.IsClosed() {
+	}
+	// If the stream is closed, recreate it.
+	if z.stream.IsClosed() {
+		// If the stream is closed, recreate it.
 		if err := z.recreateStream(); err != nil {
 			return err
 		}
 	}
-
+	// If there are pending metrics, flush the stream.
 	if z.pending.waiting {
 		if err := z.stream.Flush(); err != nil {
 			return z.writeError("flushing previously admitted batch", err)
 		}
+		// Reset the waiting flag.
 		z.pending.waiting = false
+		// Clear the admitted batches.
 		z.pending.admitted = nil
 	}
 
+	// Loop while there are remaining chunks.
 	for len(z.pending.remaining) > 0 {
+		// Get the first chunk.
 		chunk := z.pending.remaining[0]
+		// Ingest the chunk.
 		if _, err := z.stream.IngestRecordsOffset(chunk.records, chunk.encoded); err != nil {
 			return z.writeError("admitting batch", err)
 		}
+		// Remove the chunk from the remaining chunks & add it to the admitted batches.
 		z.pending.remaining = z.pending.remaining[1:]
 		z.pending.admitted = append(z.pending.admitted, chunk)
+		// Set the waiting flag.
 		z.pending.waiting = true
 	}
 
+	// If there are still pending metrics, flush the stream.
 	if z.pending.waiting {
+		// Flush the stream.
 		if err := z.stream.Flush(); err != nil {
 			return z.writeError("flushing batch", err)
 		}
 	}
+	// Reset the pending metrics.
 	z.pending = nil
 	return nil
 }
 
+// Chunk the records into smaller batches.
 func (z *Zerobus) chunkRecords(records [][]byte) ([]recordBatch, error) {
+	// Get the maximum payload bytes.
 	maxBytes := int(z.MaxPayloadBytes)
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxPayloadBytes
 	}
+	// Calculate the payload budget.
 	payloadBudget := maxBytes - batchEnvelopeReserve
+	// If the payload budget is too small, return an error.
 	if payloadBudget <= 0 {
 		return nil, fmt.Errorf(
 			"max_payload_bytes=%d is too small; it must exceed %d bytes",
@@ -509,9 +574,13 @@ func (z *Zerobus) chunkRecords(records [][]byte) ([]recordBatch, error) {
 		)
 	}
 
+	// Create a slice to store the chunks.
 	chunks := make([]recordBatch, 0, (len(records)+z.MaxBatchRecords-1)/z.MaxBatchRecords)
+	// Loop while there are records to chunk.
 	for len(records) > 0 {
+		// Initialize the count and size.
 		count, size := 0, 0
+		// Loop while there are records to chunk and the count is less than the maximum batch records.
 		for count < len(records) && count < z.MaxBatchRecords {
 			recordSize := protowire.SizeTag(1) + protowire.SizeBytes(len(records[count]))
 			if err := z.validateRecordSize(recordSize, payloadBudget); err != nil {
@@ -538,34 +607,43 @@ func (z *Zerobus) chunkRecords(records [][]byte) ([]recordBatch, error) {
 	return chunks, nil
 }
 
+// Prepare the metrics for the Zerobus server.
 func (z *Zerobus) prepareMetrics(metrics []telegraf.Metric) preparedWrite {
+	// Create a prepared write.
 	prepared := preparedWrite{
 		records: make([][]byte, 0, len(metrics)),
 		accept:  make([]int, 0, len(metrics)),
 	}
+	// Get the maximum payload bytes.
 	maxBytes := int(z.MaxPayloadBytes)
 	if maxBytes <= 0 {
 		maxBytes = defaultMaxPayloadBytes
 	}
 	payloadBudget := maxBytes - batchEnvelopeReserve
 
+	// Loop through the metrics.
 	for i, metric := range metrics {
+		// Serialize the metric.
 		record, err := z.serializeMetric(metric)
+		// If the serialization is successful, validate the record size.
 		if err == nil {
 			recordSize := protowire.SizeTag(1) + protowire.SizeBytes(len(record))
 			err = z.validateRecordSize(recordSize, payloadBudget)
 		}
+		// If the validation is not successful, add the metric to the rejected metrics.
 		if err != nil {
 			prepared.reject = append(prepared.reject, i)
 			prepared.rejectErrors = append(prepared.rejectErrors, err)
 			continue
 		}
+		// Add the metric to the accepted metrics.
 		prepared.records = append(prepared.records, record)
 		prepared.accept = append(prepared.accept, i)
 	}
 	return prepared
 }
 
+// Return the result of the prepared write.
 func (p *preparedWrite) result() error {
 	if len(p.reject) == 0 {
 		return nil
@@ -582,7 +660,9 @@ func (p *preparedWrite) result() error {
 	}
 }
 
+// Validate the record size.
 func (z *Zerobus) validateRecordSize(recordSize, payloadBudget int) error {
+	// If the record size is greater than the payload budget, return an error.
 	if recordSize > payloadBudget {
 		return fmt.Errorf(
 			"requires %d bytes, exceeding the payload budget of %d bytes",
@@ -604,25 +684,15 @@ func (z *Zerobus) validateRecordSize(recordSize, payloadBudget int) error {
 	return nil
 }
 
+// Calculate the retained payload size.
 func retainedPayloadSize(recordBytes, recordCount int) int64 {
 	return int64(recordBytes) +
 		int64(recordCount)*bufferedRecordOverhead +
 		bufferedRequestOverhead
 }
 
-func serializeMetrics(metrics []telegraf.Metric) ([][]byte, error) {
-	records := make([][]byte, 0, len(metrics))
-	for _, metric := range metrics {
-		serialized, err := serializeMetric(metric)
-		if err != nil {
-			return nil, err
-		}
-		records = append(records, serialized)
-	}
-	return records, nil
-}
-
-func serializeMetric(metric telegraf.Metric) ([]byte, error) {
+// Serialize a metric for static mode.
+func serializeStaticMetric(metric telegraf.Metric) ([]byte, error) {
 	record, err := metricToProto(metric)
 	if err != nil {
 		return nil, fmt.Errorf("serializing metric failed: %w", err)
@@ -634,18 +704,21 @@ func serializeMetric(metric telegraf.Metric) ([]byte, error) {
 	return serialized, nil
 }
 
+// Serialize a metric based on the schema mode.
 func (z *Zerobus) serializeMetric(metric telegraf.Metric) ([]byte, error) {
 	if z.SchemaMode == schemaModeTableSchema {
 		return metricToTableSchemaJSON(metric, z.TimestampColumn, z.MeasurementColumn)
 	}
-	return serializeMetric(metric)
+	return serializeStaticMetric(metric)
 }
 
+// Check if the records contain another set of records as a prefix.
 func recordsHavePrefix(records, prefix [][]byte) bool {
 	return len(records) >= len(prefix) &&
 		slices.EqualFunc(records[:len(prefix)], prefix, slices.Equal)
 }
 
+// Get the stream options.
 func (z *Zerobus) streamOptions() []sdkzerobus.StreamOption {
 	options := []sdkzerobus.StreamOption{sdkzerobus.WithWaitForReady()}
 	if z.MaxInflight > 0 {
@@ -681,16 +754,19 @@ func (z *Zerobus) streamOptions() []sdkzerobus.StreamOption {
 	return options
 }
 
+// Write an error.
 func (z *Zerobus) writeError(operation string, err error) error {
 	retryable := sdkzerobus.Retryable(err)
 	return fmt.Errorf("Zerobus %s failed (retryable=%t): %w", operation, retryable, err)
 }
 
+// Get the message descriptor.
 func messageDescriptor() ([]byte, error) {
 	descriptor := protodesc.ToDescriptorProto((&TelegrafMetric{}).ProtoReflect().Descriptor())
 	return proto.Marshal(descriptor)
 }
 
+// Register the Zerobus output plugin.
 func init() {
 	outputs.Add("zerobus", func() telegraf.Output {
 		return &Zerobus{

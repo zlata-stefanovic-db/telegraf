@@ -10,16 +10,6 @@ message TelegrafMetric {
   required string measurement = 1;
   required int64 timestamp_ns = 2;
   map<string, string> tags = 3;
-  repeated FieldValue fields = 4;
-
-  // FieldValue stores one typed field; exactly one value is set.
-  message FieldValue {
-    required string key = 1;
-    required string type = 2;
-    optional int64 int_value = 3;
-    optional int64 uint_value = 4;
-    optional double float_value = 5;
-    optional bool bool_value = 6;
-    optional string string_value = 7;
-  }
+  // JSON object holding the metric fields; Zerobus stores it as VARIANT.
+  required string fields = 4;
 }

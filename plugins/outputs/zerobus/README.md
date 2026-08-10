@@ -225,11 +225,10 @@ its own, so the rest of the batch is still written.
 ## Concurrent streams
 
 Raise the agent's `metric_batch_size` before adding streams. Each write incurs a
-fixed acknowledgment latency that extra streams cannot reduce, so below roughly
-50,000 metrics per batch they change little; a bigger batch amortizes that
-latency over more metrics. Past that size extra streams do help, and above
-64 MiB they help twice: each stream buffers its own share, so the batch no
-longer has to be sent in stages. See the [Zerobus quotas][quotas].
+fixed acknowledgment latency that extra streams cannot reduce, so they help only
+once a batch is large enough for the per-record work to outweigh that latency.
+Above 64 MiB they help twice, because each stream buffers its own share and the
+batch no longer has to be sent in stages. See the [Zerobus quotas][quotas].
 
 Each batch is split into one contiguous share per stream, sent in parallel.
 Zerobus guarantees delivery order per stream only, so shares are not ordered

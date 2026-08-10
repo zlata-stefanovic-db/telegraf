@@ -73,7 +73,7 @@ to use them.
   ## Schema-fetch timeout; zero uses the SDK default.
   # schema_fetch_timeout = "0s"
 
-  ## Number of streams to spread over,
+  ## Number of streams each batch is spread over.
   ## NOTE: Zerobus guarantees delivery order per stream, so with two or more
   ##       streams metrics are no longer ordered across the batch.
   # concurrent_streams = 1
@@ -224,25 +224,18 @@ its own, so the rest of the batch is still written.
 
 ## Concurrent streams
 
-A single stream keeps many requests in flight at once, and Zerobus provisions
-each stream for 100 MB/s and 100,000 records/s, far above what a typical agent
-produces. Prefer raising the agent's `metric_batch_size` before adding streams:
-more records per request keeps metrics ordered. See the [Zerobus
-quotas][quotas].
+Raise the agent's `metric_batch_size` before adding streams. Each write incurs a
+fixed acknowledgment latency that extra streams cannot reduce, so below roughly
+50,000 metrics per batch they change little; a bigger batch amortizes that
+latency over more metrics. Past that size extra streams do help, and above
+64 MiB they help twice: each stream buffers its own share, so the batch no
+longer has to be sent in stages. See the [Zerobus quotas][quotas].
 
-Set `concurrent_streams` above one when one stream cannot keep up, usually
-because round-trip latency rather than the quota is the limit. Each batch is
-split into that many contiguous shares that are sent in parallel, one per
-stream, and the streams stay open for the lifetime of the plugin.
-
-Zerobus guarantees delivery order per stream, so several streams trade ordering
-for throughput: each stream still writes its own share in order, but the shares
-are written independently and are not ordered against each other. Metrics carry
-their own timestamp, so sort on it when a query depends on order.
-
-When one stream fails, Telegraf keeps the whole batch, so the retry resumes only
-the streams that did not finish and skips the records the others already
-acknowledged.
+Each batch is split into one contiguous share per stream, sent in parallel.
+Zerobus guarantees delivery order per stream only, so shares are not ordered
+against each other; sort on the metric timestamp when order matters. If one
+stream fails, Telegraf keeps the whole batch and the retry resumes only the
+streams that did not finish.
 
 [quotas]: https://docs.databricks.com/aws/en/ingestion/zerobus-quotas
 

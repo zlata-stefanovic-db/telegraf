@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	sdkzerobus "github.com/databricks/zerobus-sdk/purego/zerobus"
@@ -52,6 +53,7 @@ type Zerobus struct {
 	SchemaFetchTimeout config.Duration `toml:"schema_fetch_timeout"`
 	ConnectTimeout     config.Duration `toml:"connect_timeout"`
 
+	ConcurrentStreams       int             `toml:"concurrent_streams"`
 	MaxInflight             int             `toml:"max_inflight"`
 	MaxBufferedPayloadBytes config.Size     `toml:"max_buffered_payload_bytes"`
 	MaxBatchRecords         int             `toml:"max_batch_records"`
@@ -62,13 +64,22 @@ type Zerobus struct {
 	LackOfAckTimeout        config.Duration `toml:"lack_of_ack_timeout"`
 	FlushTimeout            config.Duration `toml:"flush_timeout"`
 
-	sdk              sdkClient
-	stream           ingestStream
-	newSDK           sdkFactory
-	pending          *pendingWrite
-	confirmed        [][]byte
+	sdk       sdkClient
+	writers   []*writer
+	newSDK    sdkFactory
+	original  [][]byte
+	confirmed [][]byte
+
+	descriptorMu     sync.Mutex
 	descriptor       []byte
 	descriptorReused bool
+}
+
+// One Zerobus stream together with the write state that survives a failed
+// flush. Writers are independent, so they can be flushed concurrently.
+type writer struct {
+	stream  ingestStream
+	pending *pendingWrite
 }
 
 // Interface for the ingest stream.
@@ -82,7 +93,6 @@ type ingestStream interface {
 
 // Struct for the pending write.
 type pendingWrite struct {
-	original  [][]byte
 	admitted  []recordBatch
 	remaining []recordBatch
 	waiting   bool
@@ -242,6 +252,12 @@ func (z *Zerobus) Init() error {
 		return errors.New(`option "client_secret" must be set`)
 	}
 
+	if z.ConcurrentStreams < 0 {
+		return errors.New(`option "concurrent_streams" cannot be negative`)
+	}
+	if z.ConcurrentStreams == 0 {
+		z.ConcurrentStreams = 1
+	}
 	if z.MaxInflight < 0 {
 		return errors.New(`option "max_inflight" cannot be negative`)
 	}
@@ -333,16 +349,24 @@ func (z *Zerobus) Connect() error {
 	// Create a context with a timeout for the connection.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(z.ConnectTimeout))
 	defer cancel()
-	// Open a stream to the Zerobus server.
-	if err := z.openStream(ctx, secret.String()); err != nil {
-		// If the stream creation fails, close the SDK client and return an error.
-		z.sdk = nil
-		startupErr := &internal.StartupError{
-			Err:   fmt.Errorf("creating Zerobus stream failed: %w", err),
-			Retry: sdkzerobus.Retryable(err),
+	// Open one stream per configured writer. The first stream fetches the table
+	// schema descriptor and the rest reuse it.
+	writers := make([]*writer, 0, z.ConcurrentStreams)
+	for range z.ConcurrentStreams {
+		w := &writer{}
+		if err := z.openStream(ctx, w, secret.String()); err != nil {
+			// If the stream creation fails, close everything opened so far.
+			z.writers = writers
+			closeErr := z.Close()
+			startupErr := &internal.StartupError{
+				Err:   fmt.Errorf("creating Zerobus stream failed: %w", err),
+				Retry: sdkzerobus.Retryable(err),
+			}
+			return errors.Join(startupErr, closeErr)
 		}
-		return errors.Join(startupErr, sdk.Close())
+		writers = append(writers, w)
 	}
+	z.writers = writers
 
 	return nil
 }
@@ -352,19 +376,20 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 	if len(metrics) == 0 {
 		return nil
 	}
-	if z.stream == nil && (z.sdk == nil || z.pending == nil) {
+	if !z.connected() {
 		return internal.ErrNotConnected
 	}
 
 	// If there are pending metrics, try to ingest them again.
-	if z.pending != nil {
-		pendingOriginal := z.pending.original
+	if z.hasPending() {
+		pendingOriginal := z.original
 		// If the pending metrics cannot be ingested, return an error.
-		if err := z.processPending(); err != nil {
+		if err := z.flushWriters(); err != nil {
 			return err
 		}
 		// If the pending metrics were ingested successfully, clear the confirmed metrics.
 		z.confirmed = pendingOriginal
+		z.original = nil
 	}
 
 	// Prepare the metrics for the Zerobus server.
@@ -394,49 +419,131 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 		}
 	}
 
-	// Chunk the records into smaller batches.
-	chunks, err := z.chunkRecords(records)
-	if err != nil {
+	// Spread the records over the writers and chunk each share.
+	if err := z.assignRecords(records); err != nil {
 		return err
 	}
-	z.pending = &pendingWrite{
-		original:  original,
-		remaining: chunks,
-	}
+	z.original = original
 	z.confirmed = nil
 	// Try to ingest the pending metrics.
-	if err := z.processPending(); err != nil {
+	if err := z.flushWriters(); err != nil {
 		return err
 	}
+	z.original = nil
 	// Return the result of the ingestion.
 	return prepared.result()
 }
 
+// Report whether a stream is open or a pending write can still be resumed.
+func (z *Zerobus) connected() bool {
+	for _, w := range z.writers {
+		if w.stream != nil {
+			return true
+		}
+	}
+	return z.sdk != nil && z.hasPending()
+}
+
+// Report whether any writer was left mid-write by an earlier flush failure.
+func (z *Zerobus) hasPending() bool {
+	for _, w := range z.writers {
+		if w.pending != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// Split the records into contiguous shares, one per writer, and chunk each
+// share into batches the stream accepts.
+func (z *Zerobus) assignRecords(records [][]byte) error {
+	shares := partitionRecords(records, len(z.writers))
+	chunked := make([][]recordBatch, len(shares))
+	for i, share := range shares {
+		chunks, err := z.chunkRecords(share)
+		if err != nil {
+			return err
+		}
+		chunked[i] = chunks
+	}
+	for i, chunks := range chunked {
+		if len(chunks) > 0 {
+			z.writers[i].pending = &pendingWrite{remaining: chunks}
+		}
+	}
+	return nil
+}
+
+// Split the records into at most count contiguous shares of near-equal size.
+func partitionRecords(records [][]byte, count int) [][][]byte {
+	if count <= 1 {
+		return [][][]byte{records}
+	}
+	size := (len(records) + count - 1) / count
+	shares := make([][][]byte, 0, count)
+	for start := 0; start < len(records); start += size {
+		shares = append(shares, records[start:min(start+size, len(records))])
+	}
+	return shares
+}
+
+// Flush every writer holding pending records and join their errors. Telegraf
+// keeps the whole batch when any writer fails, so a retry resumes the writers
+// that did not finish and skips the records the others already acknowledged.
+func (z *Zerobus) flushWriters() error {
+	pending := make([]*writer, 0, len(z.writers))
+	for _, w := range z.writers {
+		if w.pending != nil {
+			pending = append(pending, w)
+		}
+	}
+	// Stay on the calling goroutine unless there is work to parallelize.
+	if len(pending) == 1 {
+		return z.processPending(pending[0])
+	}
+
+	// Each writer reports into its own slot, keeping the joined error stable.
+	var wg sync.WaitGroup
+	errs := make([]error, len(pending))
+	for i, w := range pending {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = z.processPending(w)
+		}()
+	}
+	wg.Wait()
+	return errors.Join(errs...)
+}
+
 // Close the Zerobus connection.
 func (z *Zerobus) Close() error {
-	// Close the stream.
-	var streamErr, sdkErr error
-	if z.stream != nil {
-		streamErr = z.stream.Close()
-		z.stream = nil
+	// Close the streams.
+	errs := make([]error, 0, len(z.writers)+1)
+	for _, w := range z.writers {
+		if w.stream != nil {
+			errs = append(errs, w.stream.Close())
+			w.stream = nil
+		}
 	}
+	z.writers = nil
 	// Clear the pending and confirmed metrics.
-	z.pending = nil
+	z.original = nil
 	z.confirmed = nil
 	// Clear the cached descriptor.
 	z.descriptor = nil
 	z.descriptorReused = false
 	// Close the SDK client.
 	if z.sdk != nil {
-		sdkErr = z.sdk.Close()
+		errs = append(errs, z.sdk.Close())
 		z.sdk = nil
 	}
-	// Return the errors from the stream and SDK client.
-	return errors.Join(streamErr, sdkErr)
+	// Return the errors from the streams and SDK client.
+	return errors.Join(errs...)
 }
 
 // Open a stream to the Zerobus server.
-func (z *Zerobus) openStream(ctx context.Context, clientSecret string) error {
+func (z *Zerobus) openStream(ctx context.Context, w *writer, clientSecret string) error {
 	// Get the stream options.
 	options := z.streamOptions()
 	var (
@@ -445,22 +552,12 @@ func (z *Zerobus) openStream(ctx context.Context, clientSecret string) error {
 	)
 	// Create a table schema stream if the schema mode is table schema.
 	if z.SchemaMode == schemaModeTableSchema {
-		// Fetch the descriptor unless a reusable one is already cached.
-		if z.descriptor == nil {
-			descriptor, fetchErr := z.sdk.FetchProtoDescriptor(
-				ctx,
-				z.TableName,
-				z.ClientID,
-				clientSecret,
-			)
-			if fetchErr != nil {
-				return fetchErr
-			}
-			z.descriptor = descriptor
-			z.descriptorReused = false
+		descriptor, fetchErr := z.tableDescriptor(ctx, clientSecret)
+		if fetchErr != nil {
+			return fetchErr
 		}
 		// Add the protobuf descriptor to the stream options.
-		options = append([]sdkzerobus.StreamOption{sdkzerobus.WithProto(z.descriptor)}, options...)
+		options = append([]sdkzerobus.StreamOption{sdkzerobus.WithProto(descriptor)}, options...)
 		stream, err = z.sdk.CreateTableSchemaStream(
 			ctx,
 			z.TableName,
@@ -487,53 +584,77 @@ func (z *Zerobus) openStream(ctx context.Context, clientSecret string) error {
 	if err != nil {
 		return err
 	}
-	z.stream = stream
+	w.stream = stream
 	return nil
 }
 
+// Return the descriptor to open a table-schema stream with, fetching it only
+// when no reusable one is cached. Concurrent openers share one fetch.
+func (z *Zerobus) tableDescriptor(ctx context.Context, clientSecret string) ([]byte, error) {
+	z.descriptorMu.Lock()
+	defer z.descriptorMu.Unlock()
+	if z.descriptor != nil {
+		return z.descriptor, nil
+	}
+	descriptor, err := z.sdk.FetchProtoDescriptor(ctx, z.TableName, z.ClientID, clientSecret)
+	if err != nil {
+		return nil, err
+	}
+	z.descriptor = descriptor
+	z.descriptorReused = false
+	return descriptor, nil
+}
+
 // Recreate the stream.
-func (z *Zerobus) recreateStream() error {
+func (z *Zerobus) recreateStream(w *writer) error {
 	// Get the unacknowledged batches.
-	unacked, err := z.stream.GetUnackedBatches()
+	unacked, err := w.stream.GetUnackedBatches()
 	// If the unacknowledged batches cannot be retrieved, return an error.
 	if err != nil {
 		return z.writeError("retrieving unacknowledged batches", err)
 	}
 	// Close the stream.
-	_ = z.stream.Close()
+	_ = w.stream.Close()
 	// Clear the stream.
-	z.stream = nil
+	w.stream = nil
 	// If the schema mode is table schema, rebuild the table schema replay batches.
 	if z.SchemaMode == schemaModeTableSchema {
 		z.ageDescriptor()
-		if len(unacked) > len(z.pending.admitted) {
-			return fmt.Errorf("rebuilding table-schema replay batches failed: SDK returned %d unacknowledged batches for %d admitted batches", len(unacked), len(z.pending.admitted))
+		if len(unacked) > len(w.pending.admitted) {
+			return fmt.Errorf(
+				"rebuilding table-schema replay batches failed: SDK returned %d "+
+					"unacknowledged batches for %d admitted batches",
+				len(unacked),
+				len(w.pending.admitted),
+			)
 		}
 		// If there are unacknowledged batches, rebuild the table schema replay batches.
 		if len(unacked) > 0 {
-			start := len(z.pending.admitted) - len(unacked)
-			replay := slices.Clone(z.pending.admitted[start:])
-			z.pending.remaining = append(replay, z.pending.remaining...)
+			start := len(w.pending.admitted) - len(unacked)
+			replay := slices.Clone(w.pending.admitted[start:])
+			w.pending.remaining = append(replay, w.pending.remaining...)
 		}
 	} else {
 		// If the schema mode is static, rebuild the static schema replay batches.
-		replay := make([]recordBatch, 0, len(unacked)+len(z.pending.remaining))
+		replay := make([]recordBatch, 0, len(unacked)+len(w.pending.remaining))
 		for _, batch := range unacked {
 			replay = append(replay, recordBatch{records: batch, encoded: true})
 		}
-		z.pending.remaining = append(replay, z.pending.remaining...)
+		w.pending.remaining = append(replay, w.pending.remaining...)
 	}
 	// Clear the admitted batches.
-	z.pending.admitted = nil
+	w.pending.admitted = nil
 	// Reset the waiting flag.
-	z.pending.waiting = false
+	w.pending.waiting = false
 
-	return z.openStreamFromSecret()
+	return z.openStreamFromSecret(w)
 }
 
 // Decide whether the cached descriptor survives the next stream. The first
 // recreation reuses it and the second recreation discards it.
 func (z *Zerobus) ageDescriptor() {
+	z.descriptorMu.Lock()
+	defer z.descriptorMu.Unlock()
 	switch {
 	case z.descriptor == nil:
 	case z.descriptorReused:
@@ -544,8 +665,15 @@ func (z *Zerobus) ageDescriptor() {
 	}
 }
 
+// Mark the cached descriptor as current after a stream accepted records.
+func (z *Zerobus) freshenDescriptor() {
+	z.descriptorMu.Lock()
+	defer z.descriptorMu.Unlock()
+	z.descriptorReused = false
+}
+
 // Open a stream from the client secret.
-func (z *Zerobus) openStreamFromSecret() error {
+func (z *Zerobus) openStreamFromSecret(w *writer) error {
 	// Get the client secret.
 	secret, err := z.ClientSecret.Get()
 	if err != nil {
@@ -556,64 +684,64 @@ func (z *Zerobus) openStreamFromSecret() error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(z.ConnectTimeout))
 	defer cancel()
 	// Open a stream to the Zerobus server.
-	if err := z.openStream(ctx, secret.String()); err != nil {
+	if err := z.openStream(ctx, w, secret.String()); err != nil {
 		return z.writeError("recreating stream", err)
 	}
 	return nil
 }
 
 // Process the pending metrics.
-func (z *Zerobus) processPending() error {
+func (z *Zerobus) processPending(w *writer) error {
 	// If the stream is nil, open a new stream.
-	if z.stream == nil {
-		if err := z.openStreamFromSecret(); err != nil {
+	if w.stream == nil {
+		if err := z.openStreamFromSecret(w); err != nil {
 			return err
 		}
 	}
 	// If the stream is closed, recreate it.
-	if z.stream.IsClosed() {
+	if w.stream.IsClosed() {
 		// If the stream is closed, recreate it.
-		if err := z.recreateStream(); err != nil {
+		if err := z.recreateStream(w); err != nil {
 			return err
 		}
 	}
 	// If there are pending metrics, flush the stream.
-	if z.pending.waiting {
-		if err := z.stream.Flush(); err != nil {
+	if w.pending.waiting {
+		if err := w.stream.Flush(); err != nil {
 			return z.writeError("flushing previously admitted batch", err)
 		}
 		// Reset the waiting flag.
-		z.pending.waiting = false
+		w.pending.waiting = false
 		// Clear the admitted batches.
-		z.pending.admitted = nil
+		w.pending.admitted = nil
 	}
 
 	// Loop while there are remaining chunks.
-	for len(z.pending.remaining) > 0 {
+	for len(w.pending.remaining) > 0 {
 		// Get the first chunk.
-		chunk := z.pending.remaining[0]
+		chunk := w.pending.remaining[0]
 		// Ingest the chunk.
-		if _, err := z.stream.IngestRecordsOffset(chunk.records, chunk.encoded); err != nil {
+		if _, err := w.stream.IngestRecordsOffset(chunk.records, chunk.encoded); err != nil {
 			return z.writeError("admitting batch", err)
 		}
 		// Remove the chunk from the remaining chunks & add it to the admitted batches.
-		z.pending.remaining = z.pending.remaining[1:]
-		z.pending.admitted = append(z.pending.admitted, chunk)
+		w.pending.remaining = w.pending.remaining[1:]
+		w.pending.admitted = append(w.pending.admitted, chunk)
 		// Set the waiting flag.
-		z.pending.waiting = true
+		w.pending.waiting = true
 	}
 
 	// If there are still pending metrics, flush the stream.
-	if z.pending.waiting {
+	if w.pending.waiting {
 		// Flush the stream.
-		if err := z.stream.Flush(); err != nil {
+		if err := w.stream.Flush(); err != nil {
 			return z.writeError("flushing batch", err)
 		}
 	}
 	// The stream accepted records, so the descriptor it opened with is current.
-	z.descriptorReused = false
+	z.freshenDescriptor()
 	// Reset the pending metrics.
-	z.pending = nil
+	w.pending = nil
 	return nil
 }
 
@@ -831,10 +959,11 @@ func messageDescriptor() ([]byte, error) {
 func init() {
 	outputs.Add("zerobus", func() telegraf.Output {
 		return &Zerobus{
-			SchemaMode:      schemaModeStatic,
-			TimestampColumn: "timestamp",
-			ConnectTimeout:  config.Duration(defaultConnectTimeout),
-			MaxBatchRecords: defaultMaxBatchRecords,
+			SchemaMode:        schemaModeStatic,
+			TimestampColumn:   "timestamp",
+			ConnectTimeout:    config.Duration(defaultConnectTimeout),
+			ConcurrentStreams: 1,
+			MaxBatchRecords:   defaultMaxBatchRecords,
 		}
 	})
 }

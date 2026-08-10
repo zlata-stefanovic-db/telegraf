@@ -73,6 +73,11 @@ to use them.
   ## Schema-fetch timeout; zero uses the SDK default.
   # schema_fetch_timeout = "0s"
 
+  ## Number of streams to spread over,
+  ## NOTE: Zerobus guarantees delivery order per stream, so with two or more
+  ##       streams metrics are no longer ordered across the batch.
+  # concurrent_streams = 1
+
   ## Unacknowledged ingest-call limit; zero uses the SDK default.
   # max_inflight = 0
 
@@ -216,6 +221,30 @@ Failures return to Telegraf, which retries the original metrics. A retry resumes
 where the previous attempt stopped rather than re-sending acknowledged records.
 A metric that cannot be serialized or does not fit the budgets is rejected on
 its own, so the rest of the batch is still written.
+
+## Concurrent streams
+
+A single stream keeps many requests in flight at once, and Zerobus provisions
+each stream for 100 MB/s and 100,000 records/s, far above what a typical agent
+produces. Prefer raising the agent's `metric_batch_size` before adding streams:
+more records per request keeps metrics ordered. See the [Zerobus
+quotas][quotas].
+
+Set `concurrent_streams` above one when one stream cannot keep up, usually
+because round-trip latency rather than the quota is the limit. Each batch is
+split into that many contiguous shares that are sent in parallel, one per
+stream, and the streams stay open for the lifetime of the plugin.
+
+Zerobus guarantees delivery order per stream, so several streams trade ordering
+for throughput: each stream still writes its own share in order, but the shares
+are written independently and are not ordered against each other. Metrics carry
+their own timestamp, so sort on it when a query depends on order.
+
+When one stream fails, Telegraf keeps the whole batch, so the retry resumes only
+the streams that did not finish and skips the records the others already
+acknowledged.
+
+[quotas]: https://docs.databricks.com/aws/en/ingestion/zerobus-quotas
 
 ## Development: regenerating the protobuf binding
 

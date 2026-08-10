@@ -6,6 +6,7 @@ import (
 	"errors"
 	"math"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,6 +34,7 @@ func TestDefaults(t *testing.T) {
 	require.Equal(t, schemaModeStatic, plugin.SchemaMode)
 	require.Equal(t, "timestamp", plugin.TimestampColumn)
 	require.Equal(t, config.Duration(defaultConnectTimeout), plugin.ConnectTimeout)
+	require.Equal(t, 1, plugin.ConcurrentStreams)
 	require.Equal(t, defaultMaxBatchRecords, plugin.MaxBatchRecords)
 	require.NotEmpty(t, plugin.SampleConfig())
 }
@@ -85,6 +87,11 @@ func TestInitRejectsInvalidTuning(t *testing.T) {
 		mutate func(*Zerobus)
 		option string
 	}{
+		{
+			name:   "negative concurrent streams",
+			mutate: func(z *Zerobus) { z.ConcurrentStreams = -1 },
+			option: "concurrent_streams",
+		},
 		{
 			name:   "negative max inflight",
 			mutate: func(z *Zerobus) { z.MaxInflight = -1 },
@@ -441,7 +448,7 @@ func TestConnectPassesConfiguration(t *testing.T) {
 	require.Len(t, sdk.contexts, 1)
 	_, hasDeadline := sdk.contexts[0].Deadline()
 	require.True(t, hasDeadline)
-	require.Same(t, stream, plugin.stream)
+	require.Same(t, stream, currentStream(plugin))
 }
 
 func TestConnectCreatesTableSchemaStream(t *testing.T) {
@@ -465,7 +472,7 @@ func TestConnectCreatesTableSchemaStream(t *testing.T) {
 	require.Equal(t, 1, sdk.fetchCalls)
 	require.Len(t, sdk.options, 3)
 	require.Equal(t, []byte("descriptor"), plugin.descriptor)
-	require.Same(t, stream, plugin.stream)
+	require.Same(t, stream, currentStream(plugin))
 }
 
 func TestConnectClosesSDKWhenStreamCreationFails(t *testing.T) {
@@ -499,7 +506,7 @@ func TestConnectReturnsSDKCreationError(t *testing.T) {
 func TestWriteBatchesAndFlushesOnce(t *testing.T) {
 	stream := &fakeStream{}
 	plugin := validPlugin()
-	plugin.stream = stream
+	setStream(plugin, stream)
 	metrics := []telegraf.Metric{
 		metric.New(
 			"cpu",
@@ -526,7 +533,7 @@ func TestWriteTableSchemaUsesJSON(t *testing.T) {
 	plugin := validPlugin()
 	plugin.SchemaMode = schemaModeTableSchema
 	plugin.MeasurementColumn = "measurement"
-	plugin.stream = stream
+	setStream(plugin, stream)
 	input := metric.New(
 		"cpu",
 		map[string]string{"host": "a"},
@@ -548,7 +555,7 @@ func TestWriteTableSchemaUsesJSON(t *testing.T) {
 func TestWriteIsDeterministic(t *testing.T) {
 	stream := &fakeStream{}
 	plugin := validPlugin()
-	plugin.stream = stream
+	setStream(plugin, stream)
 	input := metric.New(
 		"cpu",
 		map[string]string{"z": "last", "a": "first"},
@@ -575,7 +582,7 @@ func TestWriteFailures(t *testing.T) {
 		stream := &fakeStream{}
 		plugin := validPlugin()
 		plugin.MaxBatchRecords = 1
-		plugin.stream = stream
+		setStream(plugin, stream)
 		input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
 		require.NoError(t, plugin.Write(input))
 		require.Equal(t, 2, stream.ingestCalls)
@@ -588,7 +595,7 @@ func TestWriteFailures(t *testing.T) {
 	t.Run("unsupported field", func(t *testing.T) {
 		stream := &fakeStream{}
 		plugin := validPlugin()
-		plugin.stream = stream
+		setStream(plugin, stream)
 		input := metricWithFields{
 			Metric: testutil.TestMetric(1),
 			fields: []*telegraf.Field{
@@ -603,7 +610,7 @@ func TestWriteFailures(t *testing.T) {
 	t.Run("admission", func(t *testing.T) {
 		stream := &fakeStream{ingestErr: admissionErr}
 		plugin := validPlugin()
-		plugin.stream = stream
+		setStream(plugin, stream)
 		err := plugin.Write([]telegraf.Metric{testutil.TestMetric(1)})
 		require.ErrorIs(t, err, admissionErr)
 		require.ErrorContains(t, err, "retryable=false")
@@ -613,7 +620,7 @@ func TestWriteFailures(t *testing.T) {
 	t.Run("flush", func(t *testing.T) {
 		stream := &fakeStream{flushErr: flushErr}
 		plugin := validPlugin()
-		plugin.stream = stream
+		setStream(plugin, stream)
 		err := plugin.Write([]telegraf.Metric{testutil.TestMetric(1)})
 		require.ErrorIs(t, err, flushErr)
 		require.Equal(t, 1, stream.ingestCalls)
@@ -629,16 +636,16 @@ func TestWriteRetriesFlushWithoutReadmitting(t *testing.T) {
 	flushErr := errors.New("flush timed out")
 	stream := &fakeStream{flushErrors: []error{flushErr, nil}}
 	plugin := validPlugin()
-	plugin.stream = stream
+	setStream(plugin, stream)
 	input := []telegraf.Metric{testutil.TestMetric(1)}
 
 	require.ErrorIs(t, plugin.Write(input), flushErr)
-	require.NotNil(t, plugin.pending)
+	require.NotNil(t, currentPending(plugin))
 	require.Equal(t, 1, stream.ingestCalls)
 	require.Equal(t, 1, stream.flushCalls)
 
 	require.NoError(t, plugin.Write(input))
-	require.Nil(t, plugin.pending)
+	require.Nil(t, currentPending(plugin))
 	require.Equal(t, 1, stream.ingestCalls, "the admitted batch must not be admitted twice")
 	require.Equal(t, 2, stream.flushCalls)
 }
@@ -647,7 +654,7 @@ func TestWriteAdmitsOnlyNewSuffixOnAugmentedRetry(t *testing.T) {
 	flushErr := errors.New("flush timed out")
 	stream := &fakeStream{flushErrors: []error{flushErr, nil, nil}}
 	plugin := validPlugin()
-	plugin.stream = stream
+	setStream(plugin, stream)
 	original := testutil.TestMetric(1)
 	added := testutil.TestMetric(2)
 
@@ -669,7 +676,7 @@ func TestWritePreservesCumulativeIdentityAcrossSuffixFailure(t *testing.T) {
 		flushErrors: []error{firstFlushErr, nil, suffixFlushErr, nil},
 	}
 	plugin := validPlugin()
-	plugin.stream = stream
+	setStream(plugin, stream)
 	original := testutil.TestMetric(1)
 	added := testutil.TestMetric(2)
 	augmented := []telegraf.Metric{original, added}
@@ -684,14 +691,14 @@ func TestWritePreservesCumulativeIdentityAcrossSuffixFailure(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{expectedAdded}, stream.batches[1])
 	require.Equal(t, 4, stream.flushCalls)
-	require.Nil(t, plugin.pending)
+	require.Nil(t, currentPending(plugin))
 }
 
 func TestWriteReturnsPartialErrorAfterPendingWriteSucceeds(t *testing.T) {
 	flushErr := errors.New("flush timed out")
 	stream := &fakeStream{flushErrors: []error{flushErr, nil, nil}}
 	plugin := validPlugin()
-	plugin.stream = stream
+	setStream(plugin, stream)
 	original := testutil.TestMetric(1)
 	unsupported := metricWithFields{
 		Metric: testutil.TestMetric(2),
@@ -722,18 +729,225 @@ func TestWriteResumesAfterPartialChunkAdmission(t *testing.T) {
 	stream := &fakeStream{ingestErrors: []error{nil, admissionErr, nil}}
 	plugin := validPlugin()
 	plugin.MaxBatchRecords = 1
-	plugin.stream = stream
+	setStream(plugin, stream)
 	input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
 
 	require.ErrorIs(t, plugin.Write(input), admissionErr)
-	require.NotNil(t, plugin.pending)
+	require.NotNil(t, currentPending(plugin))
 	require.Equal(t, 2, stream.ingestCalls)
 	require.Equal(t, 0, stream.flushCalls)
 
 	require.NoError(t, plugin.Write(input))
-	require.Nil(t, plugin.pending)
+	require.Nil(t, currentPending(plugin))
 	require.Equal(t, 3, stream.ingestCalls)
 	require.Equal(t, 2, stream.flushCalls)
+}
+
+func TestConnectOpensConfiguredStreams(t *testing.T) {
+	streams := []ingestStream{&fakeStream{}, &fakeStream{}, &fakeStream{}}
+	sdk := &fakeSDK{streams: slices.Clone(streams)}
+	plugin := validPlugin()
+	plugin.ConcurrentStreams = 3
+	plugin.newSDK = func(string, string, ...sdkzerobus.Option) (sdkClient, error) {
+		return sdk, nil
+	}
+
+	require.NoError(t, plugin.Init())
+	require.NoError(t, plugin.Connect())
+	require.Equal(t, 3, sdk.staticSchemaCalls)
+	require.Len(t, plugin.writers, 3)
+	for i, w := range plugin.writers {
+		require.Same(t, streams[i], w.stream)
+	}
+}
+
+func TestConnectFetchesTableSchemaOnceForAllStreams(t *testing.T) {
+	sdk := &fakeSDK{streams: []ingestStream{&fakeStream{}, &fakeStream{}, &fakeStream{}}}
+	plugin := validPlugin()
+	plugin.SchemaMode = schemaModeTableSchema
+	plugin.ConcurrentStreams = 3
+	plugin.newSDK = func(string, string, ...sdkzerobus.Option) (sdkClient, error) {
+		return sdk, nil
+	}
+
+	require.NoError(t, plugin.Init())
+	require.NoError(t, plugin.Connect())
+	require.Equal(t, 3, sdk.tableSchemaCalls)
+	require.Equal(t, 1, sdk.fetchCalls)
+}
+
+func TestConnectClosesOpenedStreamsWhenLaterStreamFails(t *testing.T) {
+	createErr := errors.New("create stream failed")
+	opened := &fakeStream{}
+	sdk := &fakeSDK{
+		streams:      []ingestStream{opened},
+		createErrors: []error{nil, createErr},
+	}
+	plugin := validPlugin()
+	plugin.ConcurrentStreams = 2
+	plugin.newSDK = func(string, string, ...sdkzerobus.Option) (sdkClient, error) {
+		return sdk, nil
+	}
+
+	require.NoError(t, plugin.Init())
+	require.ErrorIs(t, plugin.Connect(), createErr)
+	require.Equal(t, 1, opened.closeCalls)
+	require.Equal(t, 1, sdk.closeCalls)
+	require.Nil(t, plugin.writers)
+}
+
+func TestWriteSplitsRecordsAcrossStreams(t *testing.T) {
+	first := &fakeStream{}
+	second := &fakeStream{}
+	plugin := validPlugin()
+	plugin.writers = []*writer{{stream: first}, {stream: second}}
+	input := []telegraf.Metric{
+		testutil.TestMetric(1),
+		testutil.TestMetric(2),
+		testutil.TestMetric(3),
+	}
+
+	require.NoError(t, plugin.Write(input))
+
+	// Three records over two streams leave the remainder on the first stream.
+	records := make([][]byte, 0, len(input))
+	for _, m := range input {
+		record, err := serializeStaticMetric(m)
+		require.NoError(t, err)
+		records = append(records, record)
+	}
+	require.Equal(t, 1, first.ingestCalls)
+	require.Equal(t, 1, second.ingestCalls)
+	require.Equal(t, records[:2], first.batches[0])
+	require.Equal(t, records[2:], second.batches[0])
+	require.Equal(t, 1, first.flushCalls)
+	require.Equal(t, 1, second.flushCalls)
+}
+
+func TestWriteUsesOneStreamForSingleRecord(t *testing.T) {
+	first := &fakeStream{}
+	second := &fakeStream{}
+	plugin := validPlugin()
+	plugin.writers = []*writer{{stream: first}, {stream: second}}
+
+	require.NoError(t, plugin.Write([]telegraf.Metric{testutil.TestMetric(1)}))
+	require.Equal(t, 1, first.ingestCalls)
+	require.Zero(t, second.ingestCalls)
+	require.Zero(t, second.flushCalls)
+}
+
+func TestWriteKeepsBatchWhenOneStreamFails(t *testing.T) {
+	flushErr := errors.New("flush timed out")
+	first := &fakeStream{}
+	second := &fakeStream{flushErrors: []error{flushErr, nil}}
+	plugin := validPlugin()
+	plugin.writers = []*writer{{stream: first}, {stream: second}}
+	input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
+
+	require.ErrorIs(t, plugin.Write(input), flushErr)
+	require.Nil(t, plugin.writers[0].pending)
+	require.NotNil(t, plugin.writers[1].pending)
+
+	// Telegraf keeps the whole batch, so the retry resumes the stream that did
+	// not finish and re-admits nothing on the stream that already succeeded.
+	require.NoError(t, plugin.Write(input))
+	require.Nil(t, plugin.writers[1].pending)
+	require.Equal(t, 1, first.ingestCalls)
+	require.Equal(t, 1, second.ingestCalls)
+	require.Equal(t, 2, second.flushCalls)
+}
+
+func TestWriteRecreatesTerminalStreamsConcurrently(t *testing.T) {
+	firstClosed := &fakeStream{closed: true}
+	secondClosed := &fakeStream{closed: true}
+	replacements := []ingestStream{&fakeStream{}, &fakeStream{}}
+	sdk := &fakeSDK{streams: slices.Clone(replacements)}
+	plugin := validPlugin()
+	plugin.sdk = sdk
+	plugin.writers = []*writer{{stream: firstClosed}, {stream: secondClosed}}
+	input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
+
+	require.NoError(t, plugin.Write(input))
+	require.Equal(t, 2, sdk.staticSchemaCalls)
+	require.Equal(t, 1, firstClosed.closeCalls)
+	require.Equal(t, 1, secondClosed.closeCalls)
+	for _, w := range plugin.writers {
+		require.Contains(t, replacements, w.stream)
+	}
+}
+
+func TestWriteFetchesTableSchemaOnceForConcurrentRecreations(t *testing.T) {
+	sdk := &fakeSDK{
+		streams:    []ingestStream{&fakeStream{}, &fakeStream{}},
+		fetchDelay: 50 * time.Millisecond,
+	}
+	plugin := validPlugin()
+	plugin.SchemaMode = schemaModeTableSchema
+	plugin.sdk = sdk
+	plugin.writers = []*writer{
+		{stream: &fakeStream{closed: true}},
+		{stream: &fakeStream{closed: true}},
+	}
+	input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
+
+	require.NoError(t, plugin.Write(input))
+	require.Equal(t, 2, sdk.tableSchemaCalls)
+	require.Equal(t, 1, sdk.fetchCalls)
+}
+
+func TestCloseClosesAllStreams(t *testing.T) {
+	first := &fakeStream{}
+	second := &fakeStream{}
+	sdk := &fakeSDK{}
+	plugin := validPlugin()
+	plugin.sdk = sdk
+	plugin.writers = []*writer{{stream: first}, {stream: second}}
+
+	require.NoError(t, plugin.Close())
+	require.Equal(t, 1, first.closeCalls)
+	require.Equal(t, 1, second.closeCalls)
+	require.Equal(t, 1, sdk.closeCalls)
+	require.Nil(t, plugin.writers)
+}
+
+func TestPartitionRecords(t *testing.T) {
+	records := [][]byte{[]byte("a"), []byte("b"), []byte("c"), []byte("d"), []byte("e")}
+	tests := []struct {
+		name     string
+		count    int
+		expected [][][]byte
+	}{
+		{
+			name:     "single share",
+			count:    1,
+			expected: [][][]byte{records},
+		},
+		{
+			name:     "remainder on the leading shares",
+			count:    2,
+			expected: [][][]byte{records[:3], records[3:]},
+		},
+		{
+			name:  "even shares",
+			count: 5,
+			expected: [][][]byte{
+				records[:1], records[1:2], records[2:3], records[3:4], records[4:],
+			},
+		},
+		{
+			name:  "fewer records than shares",
+			count: 8,
+			expected: [][][]byte{
+				records[:1], records[1:2], records[2:3], records[3:4], records[4:],
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.expected, partitionRecords(records, tt.count))
+		})
+	}
 }
 
 func TestWriteRecreatesTerminalStream(t *testing.T) {
@@ -742,7 +956,7 @@ func TestWriteRecreatesTerminalStream(t *testing.T) {
 	sdk := &fakeSDK{stream: replacement}
 	plugin := validPlugin()
 	plugin.sdk = sdk
-	plugin.stream = closed
+	setStream(plugin, closed)
 
 	require.NoError(t, plugin.Write([]telegraf.Metric{testutil.TestMetric(1)}))
 	require.Equal(t, 1, closed.unackedCalls)
@@ -750,7 +964,7 @@ func TestWriteRecreatesTerminalStream(t *testing.T) {
 	require.Equal(t, 1, sdk.staticSchemaCalls)
 	require.Equal(t, 1, replacement.ingestCalls)
 	require.Equal(t, 1, replacement.flushCalls)
-	require.Same(t, replacement, plugin.stream)
+	require.Same(t, replacement, currentStream(plugin))
 }
 
 func TestWriteRetriesFailedStreamRecreation(t *testing.T) {
@@ -763,18 +977,18 @@ func TestWriteRetriesFailedStreamRecreation(t *testing.T) {
 	}
 	plugin := validPlugin()
 	plugin.sdk = sdk
-	plugin.stream = closed
+	setStream(plugin, closed)
 	input := []telegraf.Metric{testutil.TestMetric(1)}
 
 	require.ErrorIs(t, plugin.Write(input), recreateErr)
-	require.Nil(t, plugin.stream)
-	require.NotNil(t, plugin.pending)
+	require.Nil(t, currentStream(plugin))
+	require.NotNil(t, currentPending(plugin))
 
 	require.NoError(t, plugin.Write(input))
-	require.Same(t, replacement, plugin.stream)
+	require.Same(t, replacement, currentStream(plugin))
 	require.Equal(t, 2, sdk.staticSchemaCalls)
 	require.Equal(t, 1, replacement.ingestCalls)
-	require.Nil(t, plugin.pending)
+	require.Nil(t, currentPending(plugin))
 }
 
 func TestWriteReplaysOnlyUnacknowledgedRecordsAfterTerminalFailure(t *testing.T) {
@@ -784,7 +998,7 @@ func TestWriteReplaysOnlyUnacknowledgedRecordsAfterTerminalFailure(t *testing.T)
 	sdk := &fakeSDK{stream: replacement}
 	plugin := validPlugin()
 	plugin.sdk = sdk
-	plugin.stream = closed
+	setStream(plugin, closed)
 	input := []telegraf.Metric{testutil.TestMetric(1)}
 
 	require.ErrorIs(t, plugin.Write(input), flushErr)
@@ -797,7 +1011,7 @@ func TestWriteReplaysOnlyUnacknowledgedRecordsAfterTerminalFailure(t *testing.T)
 	require.Equal(t, 1, replacement.ingestCalls)
 	require.Equal(t, closed.batches[0], replacement.batches[0])
 	require.Equal(t, []bool{true}, replacement.encoded)
-	require.Nil(t, plugin.pending)
+	require.Nil(t, currentPending(plugin))
 }
 
 func TestWriteTableSchemaReencodesRecordsAfterTerminalFailure(t *testing.T) {
@@ -808,7 +1022,7 @@ func TestWriteTableSchemaReencodesRecordsAfterTerminalFailure(t *testing.T) {
 	plugin := validPlugin()
 	plugin.SchemaMode = schemaModeTableSchema
 	plugin.sdk = sdk
-	plugin.stream = closed
+	setStream(plugin, closed)
 	input := []telegraf.Metric{testutil.TestMetric(1)}
 
 	require.ErrorIs(t, plugin.Write(input), flushErr)
@@ -820,7 +1034,7 @@ func TestWriteTableSchemaReencodesRecordsAfterTerminalFailure(t *testing.T) {
 	require.Equal(t, 1, sdk.tableSchemaCalls)
 	require.Equal(t, closed.batches[0], replacement.batches[0])
 	require.Equal(t, []bool{false}, replacement.encoded)
-	require.Nil(t, plugin.pending)
+	require.Nil(t, currentPending(plugin))
 }
 
 func TestWriteTableSchemaReusesDescriptorForReplacementStream(t *testing.T) {
@@ -831,7 +1045,7 @@ func TestWriteTableSchemaReusesDescriptorForReplacementStream(t *testing.T) {
 	plugin := validPlugin()
 	plugin.SchemaMode = schemaModeTableSchema
 	plugin.sdk = sdk
-	plugin.stream = closed
+	setStream(plugin, closed)
 	plugin.descriptor = []byte("first")
 	input := []telegraf.Metric{testutil.TestMetric(1)}
 
@@ -841,7 +1055,7 @@ func TestWriteTableSchemaReusesDescriptorForReplacementStream(t *testing.T) {
 
 	require.NoError(t, plugin.Write(input))
 	require.Equal(t, 1, sdk.tableSchemaCalls)
-	require.Same(t, replacement, plugin.stream)
+	require.Same(t, replacement, currentStream(plugin))
 	require.Zero(t, sdk.fetchCalls)
 	require.Equal(t, []byte("first"), plugin.descriptor)
 	require.False(t, plugin.descriptorReused)
@@ -860,7 +1074,7 @@ func TestWriteTableSchemaRefetchesDescriptorAfterReusedStreamFails(t *testing.T)
 	plugin := validPlugin()
 	plugin.SchemaMode = schemaModeTableSchema
 	plugin.sdk = sdk
-	plugin.stream = closed
+	setStream(plugin, closed)
 	plugin.descriptor = []byte("first")
 	input := []telegraf.Metric{testutil.TestMetric(1)}
 
@@ -870,7 +1084,7 @@ func TestWriteTableSchemaRefetchesDescriptorAfterReusedStreamFails(t *testing.T)
 
 	require.ErrorIs(t, plugin.Write(input), secondErr)
 	require.Equal(t, 1, sdk.tableSchemaCalls)
-	require.Same(t, reused, plugin.stream)
+	require.Same(t, reused, currentStream(plugin))
 	require.Zero(t, sdk.fetchCalls)
 	require.True(t, plugin.descriptorReused)
 	reused.unacked = [][][]byte{{{0x08, 0x01}}}
@@ -878,7 +1092,7 @@ func TestWriteTableSchemaRefetchesDescriptorAfterReusedStreamFails(t *testing.T)
 
 	require.NoError(t, plugin.Write(input))
 	require.Equal(t, 2, sdk.tableSchemaCalls)
-	require.Same(t, refetched, plugin.stream)
+	require.Same(t, refetched, currentStream(plugin))
 	require.Equal(t, 1, sdk.fetchCalls)
 	require.Equal(t, []byte("second"), plugin.descriptor)
 	require.False(t, plugin.descriptorReused)
@@ -888,7 +1102,7 @@ func TestCloseClearsCachedDescriptor(t *testing.T) {
 	plugin := validPlugin()
 	plugin.SchemaMode = schemaModeTableSchema
 	plugin.sdk = &fakeSDK{}
-	plugin.stream = &fakeStream{}
+	setStream(plugin, &fakeStream{})
 	plugin.descriptor = []byte("descriptor")
 	plugin.descriptorReused = true
 
@@ -906,7 +1120,7 @@ func TestWriteTableSchemaReplaysOnlyCurrentSuffix(t *testing.T) {
 	plugin := validPlugin()
 	plugin.SchemaMode = schemaModeTableSchema
 	plugin.sdk = sdk
-	plugin.stream = closed
+	setStream(plugin, closed)
 	original := testutil.TestMetric(1)
 	added := testutil.TestMetric(2)
 
@@ -935,7 +1149,7 @@ func TestWriteTableSchemaReplaysOnlyUnacknowledgedChunk(t *testing.T) {
 	plugin.SchemaMode = schemaModeTableSchema
 	plugin.MaxBatchRecords = 1
 	plugin.sdk = sdk
-	plugin.stream = closed
+	setStream(plugin, closed)
 	input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
 
 	require.ErrorIs(t, plugin.Write(input), flushErr)
@@ -953,7 +1167,7 @@ func TestWriteRejectsIndividuallyOversizedMetricBeforeAdmission(t *testing.T) {
 	stream := &fakeStream{}
 	plugin := validPlugin()
 	plugin.MaxPayloadBytes = batchEnvelopeReserve + 1
-	plugin.stream = stream
+	setStream(plugin, stream)
 
 	err := plugin.Write([]telegraf.Metric{testutil.TestMetric(1)})
 	require.ErrorContains(t, err, "exceeding the payload budget")
@@ -963,7 +1177,7 @@ func TestWriteRejectsIndividuallyOversizedMetricBeforeAdmission(t *testing.T) {
 func TestWriteRejectsInvalidMetricWithoutBlockingValidMetrics(t *testing.T) {
 	stream := &fakeStream{}
 	plugin := validPlugin()
-	plugin.stream = stream
+	setStream(plugin, stream)
 	input := []telegraf.Metric{
 		testutil.TestMetric(1),
 		metricWithFields{
@@ -993,7 +1207,7 @@ func TestWriteRejectsMetricExceedingBufferedPayloadLimit(t *testing.T) {
 	stream := &fakeStream{}
 	plugin := validPlugin()
 	plugin.MaxBufferedPayloadBytes = config.Size(retainedPayloadSize(recordSize, 1) - 1)
-	plugin.stream = stream
+	setStream(plugin, stream)
 
 	err = plugin.Write([]telegraf.Metric{testutil.TestMetric(1)})
 	var writeErr *internal.PartialWriteError
@@ -1013,7 +1227,7 @@ func TestWriteSplitsBatchByPayloadSize(t *testing.T) {
 	plugin.MaxPayloadBytes = config.Size(
 		batchEnvelopeReserve + protowire.SizeTag(1) + protowire.SizeBytes(len(first)),
 	)
-	plugin.stream = stream
+	setStream(plugin, stream)
 
 	require.NoError(t, plugin.Write(input))
 	require.Equal(t, 2, stream.ingestCalls)
@@ -1038,7 +1252,7 @@ func TestWriteSplitsBatchByBufferedPayloadSize(t *testing.T) {
 		retainedPayloadSize(firstSize, 1),
 		retainedPayloadSize(secondSize, 1),
 	))
-	plugin.stream = stream
+	setStream(plugin, stream)
 
 	require.NoError(t, plugin.Write(input))
 	require.Equal(t, 2, stream.ingestCalls)
@@ -1053,7 +1267,7 @@ func TestCloseIsIdempotentAndJoinsErrors(t *testing.T) {
 	stream := &fakeStream{closeErr: streamErr}
 	sdk := &fakeSDK{closeErr: sdkErr}
 	plugin := validPlugin()
-	plugin.stream = stream
+	setStream(plugin, stream)
 	plugin.sdk = sdk
 
 	err := plugin.Close()
@@ -1069,17 +1283,29 @@ func TestCloseIsIdempotentAndJoinsErrors(t *testing.T) {
 
 func validPlugin() *Zerobus {
 	return &Zerobus{
-		ServerEndpoint:  "https://workspace.zerobus.example.com",
-		WorkspaceURL:    "https://workspace.example.com",
-		TableName:       "catalog.schema.metrics",
-		ClientID:        "client",
-		ClientSecret:    config.NewSecret([]byte("secret")),
-		ApplicationName: "telegraf",
-		SchemaMode:      schemaModeStatic,
-		TimestampColumn: "timestamp",
-		ConnectTimeout:  config.Duration(defaultConnectTimeout),
-		MaxBatchRecords: defaultMaxBatchRecords,
+		ServerEndpoint:    "https://workspace.zerobus.example.com",
+		WorkspaceURL:      "https://workspace.example.com",
+		TableName:         "catalog.schema.metrics",
+		ClientID:          "client",
+		ClientSecret:      config.NewSecret([]byte("secret")),
+		ApplicationName:   "telegraf",
+		SchemaMode:        schemaModeStatic,
+		TimestampColumn:   "timestamp",
+		ConnectTimeout:    config.Duration(defaultConnectTimeout),
+		ConcurrentStreams: 1,
+		MaxBatchRecords:   defaultMaxBatchRecords,
 	}
+}
+func setStream(plugin *Zerobus, stream ingestStream) {
+	plugin.writers = []*writer{{stream: stream}}
+}
+
+func currentStream(plugin *Zerobus) ingestStream {
+	return plugin.writers[0].stream
+}
+
+func currentPending(plugin *Zerobus) *pendingWrite {
+	return plugin.writers[0].pending
 }
 
 type fakeStream struct {
@@ -1139,6 +1365,7 @@ func (s *fakeStream) Close() error {
 }
 
 type fakeSDK struct {
+	mu                sync.Mutex
 	stream            ingestStream
 	streams           []ingestStream
 	createErr         error
@@ -1155,6 +1382,7 @@ type fakeSDK struct {
 	descriptors       [][]byte
 	descriptorErr     error
 	fetchCalls        int
+	fetchDelay        time.Duration
 }
 
 func (s *fakeSDK) CreateStaticSchemaStream(
@@ -1162,6 +1390,8 @@ func (s *fakeSDK) CreateStaticSchemaStream(
 	tableName, clientID, clientSecret string,
 	options ...sdkzerobus.StreamOption,
 ) (ingestStream, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.staticSchemaCalls++
 	s.tableName = tableName
 	s.clientID = clientID
@@ -1186,6 +1416,8 @@ func (s *fakeSDK) CreateTableSchemaStream(
 	tableName, clientID, clientSecret string,
 	options ...sdkzerobus.StreamOption,
 ) (ingestStream, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.tableSchemaCalls++
 	s.tableName = tableName
 	s.clientID = clientID
@@ -1209,21 +1441,27 @@ func (s *fakeSDK) FetchProtoDescriptor(
 	_ context.Context,
 	_, _, _ string,
 ) ([]byte, error) {
+	s.mu.Lock()
 	s.fetchCalls++
-	if s.descriptorErr != nil {
-		return nil, s.descriptorErr
+	delay, err := s.fetchDelay, s.descriptorErr
+	descriptor := []byte("descriptor")
+	if len(s.descriptors) > 0 {
+		descriptor = s.descriptors[0]
+		if len(s.descriptors) > 1 {
+			s.descriptors = s.descriptors[1:]
+		}
 	}
-	if len(s.descriptors) == 0 {
-		return []byte("descriptor"), nil
-	}
-	descriptor := s.descriptors[0]
-	if len(s.descriptors) > 1 {
-		s.descriptors = s.descriptors[1:]
+	s.mu.Unlock()
+	time.Sleep(delay)
+	if err != nil {
+		return nil, err
 	}
 	return descriptor, nil
 }
 
 func (s *fakeSDK) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.closeCalls++
 	return s.closeErr
 }

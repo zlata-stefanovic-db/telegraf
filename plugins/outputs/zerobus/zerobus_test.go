@@ -93,6 +93,11 @@ func TestInitRejectsInvalidTuning(t *testing.T) {
 			option: "concurrent_streams",
 		},
 		{
+			name:   "too many concurrent streams",
+			mutate: func(z *Zerobus) { z.ConcurrentStreams = maxConcurrentStreams + 1 },
+			option: "concurrent_streams",
+		},
+		{
 			name:   "negative max inflight",
 			mutate: func(z *Zerobus) { z.MaxInflight = -1 },
 			option: "max_inflight",

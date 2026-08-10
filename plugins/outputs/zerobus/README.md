@@ -73,7 +73,7 @@ to use them.
   ## Schema-fetch timeout; zero uses the SDK default.
   # schema_fetch_timeout = "0s"
 
-  ## Number of streams each batch is spread over.
+  ## Number of streams each batch is spread over (maximum 100).
   ## NOTE: Zerobus guarantees delivery order per stream, so with two or more
   ##       streams metrics are no longer ordered across the batch.
   # concurrent_streams = 1
@@ -224,11 +224,12 @@ its own, so the rest of the batch is still written.
 
 ## Concurrent streams
 
-Raise the agent's `metric_batch_size` before adding streams. Each write incurs a
-fixed acknowledgment latency that extra streams cannot reduce, so they help only
-once a batch is large enough for the per-record work to outweigh that latency.
-Above 64 MiB they help twice, because each stream buffers its own share and the
-batch no longer has to be sent in stages. See the [Zerobus quotas][quotas].
+`concurrent_streams` is capped at 100. Raise the agent's `metric_batch_size`
+before adding streams. Each write incurs a fixed acknowledgment latency that
+extra streams cannot reduce, so they help only once a batch is large enough for
+the per-record work to outweigh that latency. Above 64 MiB they help twice,
+because each stream buffers its own share and the batch no longer has to be sent
+in stages. See the [Zerobus quotas][quotas].
 
 Each batch is split into one contiguous share per stream, sent in parallel.
 Zerobus guarantees delivery order per stream only, so shares are not ordered

@@ -34,6 +34,7 @@ const (
 	batchEnvelopeReserve    = 1024
 	bufferedRequestOverhead = 512
 	bufferedRecordOverhead  = 32
+	maxConcurrentStreams    = 100
 	schemaModeStatic        = "static"
 	schemaModeTableSchema   = "table_schema"
 )
@@ -254,6 +255,12 @@ func (z *Zerobus) Init() error {
 
 	if z.ConcurrentStreams < 0 {
 		return errors.New(`option "concurrent_streams" cannot be negative`)
+	}
+	if z.ConcurrentStreams > maxConcurrentStreams {
+		return fmt.Errorf(
+			`option "concurrent_streams" must not exceed %d`,
+			maxConcurrentStreams,
+		)
 	}
 	if z.ConcurrentStreams == 0 {
 		z.ConcurrentStreams = 1

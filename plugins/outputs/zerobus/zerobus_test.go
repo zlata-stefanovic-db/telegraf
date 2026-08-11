@@ -1268,7 +1268,7 @@ func TestWriteSplitsBatchByBufferedPayloadSize(t *testing.T) {
 
 func TestCloseIsIdempotentAndJoinsErrors(t *testing.T) {
 	streamErr := errors.New("stream close failed")
-	sdkErr := errors.New("SDK close failed")
+	sdkErr := errors.New("sdk close failed")
 	stream := &fakeStream{closeErr: streamErr}
 	sdk := &fakeSDK{closeErr: sdkErr}
 	plugin := validPlugin()

@@ -61,16 +61,14 @@ to use them.
   workspace_url = "https://<workspace>.cloud.databricks.com"
 
   ## Fully qualified Unity Catalog destination table.
-  ## NOTE: uint64 fields require BIGINT columns; values above the BIGINT
-  ##       maximum are rejected.
   table_name = "catalog.schema.telegraf_metrics"
 
   ## Schema mode: static stores fields in a VARIANT column; table_schema maps
   ## tags and fields to columns from the destination table schema.
   # schema_mode = "static"
 
-  ## Optional timestamp column for table_schema mode, encoded as Unix
-  ## microseconds. Leave empty if the table has no timestamp column.
+  ## Optional timestamp column for table_schema mode. Leave empty if the table
+  ## has no timestamp column.
   # timestamp_column = "timestamp"
 
   ## Optional measurement-name column for table_schema mode.
@@ -87,8 +85,8 @@ to use them.
   # connect_timeout = "30s"
 
   ## Number of streams each batch is spread over (maximum 100).
-  ## NOTE: Zerobus guarantees delivery order per stream, so with two or more
-  ##       streams metrics are no longer ordered across the batch.
+  ## NOTE: Ordering is only guaranteed per stream, so sort on the metric
+  ##       timestamp when using more than one.
   # concurrent_streams = 1
 
   ## Number of times a broken stream is recovered before the write fails.
@@ -205,16 +203,14 @@ own, so the rest of the batch is still written.
 
 ## Concurrent streams
 
-`concurrent_streams` is capped at 100. Raise the agent's `metric_batch_size`
-before adding streams. Each write waits a fixed amount of time for Databricks to
-acknowledge it, which extra streams cannot shorten, so they only pay off once a
-batch is large enough that the per-record work outweighs that wait. See the
-[Zerobus quotas][quotas] for what a single stream can sustain.
+Raise the agent's `metric_batch_size` before adding streams. Each write waits a
+fixed amount of time for Databricks to acknowledge it, which extra streams
+cannot shorten, so they only pay off once a batch is large enough that the
+per-record work outweighs that wait. See the [Zerobus quotas][quotas] for what a
+single stream can sustain.
 
-Each batch is split into one contiguous share per stream, sent in parallel.
-Zerobus guarantees delivery order per stream only, so shares are not ordered
-against each other; sort on the metric timestamp when order matters. If one
-stream fails, Telegraf keeps the whole batch and the retry resumes only the
+Each batch is divided into one contiguous share per stream, sent in parallel. If
+one stream fails, Telegraf keeps the whole batch and the retry resumes only the
 streams that did not finish.
 
 [quotas]: https://docs.databricks.com/aws/en/ingestion/zerobus-quotas

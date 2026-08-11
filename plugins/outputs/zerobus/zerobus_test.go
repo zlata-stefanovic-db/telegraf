@@ -58,7 +58,7 @@ func TestInitRequiredOptions(t *testing.T) {
 		{
 			name:   "server endpoint",
 			mutate: func(z *Zerobus) { z.ServerEndpoint = "" },
-			option: "zerobus_server_endpoint",
+			option: "server_endpoint",
 		},
 		{
 			name:   "workspace URL",

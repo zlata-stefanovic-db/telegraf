@@ -55,7 +55,7 @@ to use them.
 # Configuration for sending metrics to Databricks Zerobus
 [[outputs.zerobus]]
   ## Zerobus gRPC service endpoint.
-  zerobus_server_endpoint = "https://<workspace-id>.zerobus.<region>.cloud.databricks.com"
+  server_endpoint = "https://<workspace-id>.zerobus.<region>.cloud.databricks.com"
 
   ## Databricks workspace URL used for OAuth authentication.
   workspace_url = "https://<workspace>.cloud.databricks.com"
@@ -196,10 +196,9 @@ Every batch is split into requests that stay within the Zerobus size limits and
 sent together. The plugin reports success only once Databricks has acknowledged
 each record.
 
-Failures return to Telegraf, which retries the original metrics. A retry resumes
-where the previous attempt stopped rather than re-sending acknowledged records.
-A metric that cannot be serialized or is too large to send is rejected on its
-own, so the rest of the batch is still written.
+A retry resumes where the previous attempt stopped rather than re-sending
+acknowledged records. A metric that cannot be encoded or is too large to send is
+rejected on its own, so the rest of the batch is still written.
 
 ## Concurrent streams
 

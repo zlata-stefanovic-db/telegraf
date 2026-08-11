@@ -41,7 +41,7 @@ const (
 
 // Zerobus writes metrics to a Databricks table.
 type Zerobus struct {
-	ServerEndpoint  string        `toml:"zerobus_server_endpoint"`
+	ServerEndpoint  string        `toml:"server_endpoint"`
 	WorkspaceURL    string        `toml:"workspace_url"`
 	TableName       string        `toml:"table_name"`
 	ClientID        string        `toml:"client_id"`
@@ -187,7 +187,7 @@ func (z *Zerobus) Init() error {
 		name  string
 		value string
 	}{
-		{"zerobus_server_endpoint", z.ServerEndpoint},
+		{"server_endpoint", z.ServerEndpoint},
 		{"workspace_url", z.WorkspaceURL},
 		{"table_name", z.TableName},
 		{"client_id", z.ClientID},

@@ -52,7 +52,6 @@ func TestConnectAndWriteIntegration(t *testing.T) {
 		SchemaMode:        schemaMode,
 		TimestampColumn:   timestampColumn,
 		MeasurementColumn: os.Getenv("ZEROBUS_MEASUREMENT_COLUMN"),
-		MaxBatchRecords:   defaultMaxBatchRecords,
 		Log:               testutil.Logger{},
 	}
 	require.NoError(t, plugin.Init())

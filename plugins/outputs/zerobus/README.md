@@ -1,9 +1,9 @@
 # Zerobus Output Plugin
 
 This plugin writes metrics to a Unity Catalog Delta table using the
-[Databricks Zerobus Ingest][zerobus] service and its Go SDK. It supports a
-static schema that stores arbitrary metrics in a fixed envelope and an opt-in
-table-schema mode that derives the protobuf schema from the destination table.
+[Databricks Zerobus Ingest][zerobus] service. It supports a static schema that
+stores arbitrary metrics in a fixed envelope and an opt-in table-schema mode
+that maps metrics onto the columns of the destination table.
 
 > [!IMPORTANT]
 > Be aware that this plugin accesses APIs that are [chargeable][pricing] and
@@ -86,54 +86,35 @@ to use them.
   ## Stream startup timeout.
   # connect_timeout = "30s"
 
-  ## Schema-fetch timeout; zero uses the SDK default.
-  # schema_fetch_timeout = "0s"
-
   ## Number of streams each batch is spread over (maximum 100).
   ## NOTE: Zerobus guarantees delivery order per stream, so with two or more
   ##       streams metrics are no longer ordered across the batch.
   # concurrent_streams = 1
 
-  ## Unacknowledged ingest-call limit; zero uses the SDK default.
-  # max_inflight = 0
+  ## Number of times a broken stream is recovered before the write fails.
+  # recovery_retries = 4
 
-  ## Buffered payload limit; zero uses the SDK default.
-  # max_buffered_payload_bytes = "0B"
+  ## Time to wait for Databricks to acknowledge a request.
+  # lack_of_ack_timeout = "60s"
 
-  ## Records per request; larger batches are split.
-  # max_batch_records = 100000
-
-  ## Request size limit; zero uses the SDK default below 10 MiB.
-  # max_payload_bytes = "0B"
-
-  ## Recovery-attempt limit; zero uses the SDK default.
-  # recovery_retries = 0
-
-  ## Recovery-attempt timeout; zero uses the SDK default.
-  # recovery_timeout = "0s"
-
-  ## Recovery delay; zero uses the SDK default.
-  # recovery_backoff = "0s"
-
-  ## Acknowledgment timeout; zero uses the SDK default.
-  # lack_of_ack_timeout = "0s"
-
-  ## Flush timeout; zero uses the SDK default.
-  # flush_timeout = "0s"
+  ## Time to wait for a batch to be written completely.
+  # flush_timeout = "5m"
 ```
 
-The service principal identified by `client_id` must have `USE CATALOG` on the
-catalog, `USE SCHEMA` on the schema, and both `SELECT` and `MODIFY` on the
-table. `Connect` waits for stream startup for up to `connect_timeout`, returning
-network, authentication, and schema errors before metrics are written.
+The service principal identified by `client_id` needs the `USE CATALOG`,
+`USE SCHEMA`, `SELECT` and `MODIFY` [privileges][privileges] on the destination
+table. Startup waits up to `connect_timeout` for the stream, so network,
+authentication and permission errors surface before any metric is written.
+
+[privileges]: https://docs.databricks.com/aws/en/data-governance/unity-catalog/manage-privileges/privileges
 
 ## Schema modes
 
 ### Static schema
 
-Static mode is the default. It uses one fixed protobuf record per Telegraf
-metric, with the metric fields in a `VARIANT` column. Create the destination
-table with this exact schema and column order:
+Static mode is the default. It writes one row per metric, with the metric fields
+in a `VARIANT` column. Create the destination table with this exact schema and
+column order:
 
 ```sql
 CREATE TABLE catalog.schema.telegraf_metrics (
@@ -144,60 +125,44 @@ CREATE TABLE catalog.schema.telegraf_metrics (
 );
 ```
 
-The static descriptor must match the Delta table one-to-one. Do not reorder,
-rename, remove, or change the nullability of these columns. Compatible future
-schema revisions will only add nullable fields with new protobuf field numbers.
+The table has to match this definition one-to-one, so do not reorder, rename,
+remove, or change the nullability of these columns. Later revisions of the
+plugin will only ever append nullable columns to it.
 
 `timestamp_ns` is a raw Unix nanosecond `BIGINT`, not a Delta `TIMESTAMP`.
 
 ### Field mapping
 
 All fields of a metric become one JSON object in the `fields` `VARIANT` column,
-which Zerobus transports as a protobuf string. Field names and types can
-therefore change without altering the destination table.
+so field names and types can change without altering the destination table.
+`int64`, `bool` and `string` values are stored as they are, while two cases are
+rejected: `uint64` values above `math.MaxInt64`, because Delta has no unsigned
+64-bit type, and non-finite `float64` values such as `NaN`, because JSON cannot
+represent them.
 
-- `int64` becomes a JSON number.
-- `uint64` values through `math.MaxInt64` become JSON numbers; larger values
-  are rejected because Delta cannot represent the full `uint64` range.
-- `float64` becomes a JSON number; non-finite values such as `NaN` are rejected
-  because JSON cannot represent them.
-- `bool` becomes a JSON boolean.
-- `string` becomes a JSON string.
-
-Telegraf normalizes input field values to these supported types before outputs
-receive them. The plugin then encodes them as JSON text, so the type stored in
-the `VARIANT` column follows how a value is written rather than its Telegraf
-type. A `float64` holding an integer value is indistinguishable from an
-`int64`, so Databricks reads it back as a `BIGINT`. The same field can therefore
-be an integer in one row and a decimal in another.
-
-Cast extracted values to a concrete type when querying. The cast pins the type
-across rows and is required for filtering, grouping, ordering, and aggregation,
-because `VARIANT` values cannot be compared, grouped, ordered, or used in set
-operations. Use `:` to select a field from the column and `::` to cast it:
+Since the values are stored as JSON, the type of a field follows the value
+rather than its Telegraf type. A `float64` holding a whole number is
+indistinguishable from an `int64`, so the same field can come back as a
+`BIGINT` in one row and a decimal in another. Select a field with `:` and cast
+it with `::` to pin the type, which Databricks requires before values can be
+filtered, grouped, ordered or aggregated:
 
 ```sql
-SELECT
-  measurement,
-  tags['host'] AS host,
-  fields:usage_idle::double AS usage_idle
+SELECT measurement, tags['host'] AS host, fields:usage_idle::double AS idle
 FROM catalog.schema.telegraf_metrics;
 ```
 
-A `::` cast fails the query when a value cannot be converted. Use
-`try_variant_get(fields, '$.usage_idle', 'double')` to return `NULL` instead.
+See the [VARIANT documentation][variant] for reading values that may not
+convert.
+
+[variant]: https://docs.databricks.com/aws/en/semi-structured/variant
 
 ### Table schema
 
-Set `schema_mode = "table_schema"` to fetch the destination table schema from
-Unity Catalog before creating the stream. The SDK builds a protobuf descriptor,
-opens a regular protobuf stream with it, and converts each JSON record produced
-by the plugin to protobuf before admission.
-
-The descriptor is reused when a failed stream is replaced, keeping the Unity
-Catalog round-trip off the recovery path. If the replacement stream also fails,
-the next one refetches the schema, so a changed table schema recovers without
-restarting Telegraf.
+Set `schema_mode = "table_schema"` to take the record layout from the columns of
+the destination table instead of the fixed schema above. The schema is read from
+Unity Catalog at startup, and if the table is altered later the plugin picks up
+the new columns on its own, without a Telegraf restart.
 
 Table-schema mode creates one flat record per metric:
 
@@ -222,30 +187,29 @@ different tables or column layouts.
 
 Declare columns as `BIGINT` for `int64` and `uint64`, `DOUBLE` for `float64`,
 `BOOLEAN` for `bool`, and `STRING` for `string`; the value limits from
-[Field mapping](#field-mapping) apply here too. A tag, field, or metadata column
-name collision is rejected before admission, as are table schemas with nullable
-arrays or maps, or collections that allow null elements, which protobuf cannot
-represent.
+[Field mapping](#field-mapping) apply here too. A table with a nullable array or
+map, or one whose collections allow null elements, cannot be used at all, and an
+individual metric is rejected when a tag or field name collides with another
+column.
 
 ## Batching and durability
 
-Each `Write` serializes the metrics, splits them into requests that fit the
-record, payload, and buffered-payload limits, and flushes once. A successful
-`Write` means every record was acknowledged.
+Every batch is split into requests that stay within the Zerobus size limits and
+sent together. The plugin reports success only once Databricks has acknowledged
+each record.
 
 Failures return to Telegraf, which retries the original metrics. A retry resumes
 where the previous attempt stopped rather than re-sending acknowledged records.
-A metric that cannot be serialized or does not fit the budgets is rejected on
-its own, so the rest of the batch is still written.
+A metric that cannot be serialized or is too large to send is rejected on its
+own, so the rest of the batch is still written.
 
 ## Concurrent streams
 
 `concurrent_streams` is capped at 100. Raise the agent's `metric_batch_size`
-before adding streams. Each write incurs a fixed acknowledgment latency that
-extra streams cannot reduce, so they help only once a batch is large enough for
-the per-record work to outweigh that latency. Above 64 MiB they help twice,
-because each stream buffers its own share and the batch no longer has to be sent
-in stages. See the [Zerobus quotas][quotas].
+before adding streams. Each write waits a fixed amount of time for Databricks to
+acknowledge it, which extra streams cannot shorten, so they only pay off once a
+batch is large enough that the per-record work outweighs that wait. See the
+[Zerobus quotas][quotas] for what a single stream can sustain.
 
 Each batch is split into one contiguous share per stream, sent in parallel.
 Zerobus guarantees delivery order per stream only, so shares are not ordered
@@ -254,15 +218,3 @@ stream fails, Telegraf keeps the whole batch and the retry resumes only the
 streams that did not finish.
 
 [quotas]: https://docs.databricks.com/aws/en/ingestion/zerobus-quotas
-
-## Development: regenerating the protobuf binding
-
-This section is for contributors modifying the plugin's protobuf schema. After
-an additive update to `metric.proto`, install `protoc-gen-go` and run:
-
-```shell
-go generate ./plugins/outputs/zerobus
-```
-
-Include the regenerated `metric.pb.go` in the same pull request as the schema
-change.

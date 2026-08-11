@@ -27,15 +27,16 @@ import (
 var sampleConfig string
 
 const (
-	defaultMaxBatchRecords  = 100_000
-	defaultMaxPayloadBytes  = 10*1024*1024 - 64*1024
-	defaultConnectTimeout   = 30 * time.Second
-	batchEnvelopeReserve    = 1024
-	bufferedRequestOverhead = 512
-	bufferedRecordOverhead  = 32
-	maxConcurrentStreams    = 100
-	schemaModeStatic        = "static"
-	schemaModeTableSchema   = "table_schema"
+	defaultMaxBatchRecords         = 100_000
+	defaultMaxPayloadBytes         = 10*1024*1024 - 64*1024
+	defaultMaxBufferedPayloadBytes = 64 * 1024 * 1024
+	defaultConnectTimeout          = 30 * time.Second
+	batchEnvelopeReserve           = 1024
+	bufferedRequestOverhead        = 512
+	bufferedRecordOverhead         = 32
+	maxConcurrentStreams           = 100
+	schemaModeStatic               = "static"
+	schemaModeTableSchema          = "table_schema"
 )
 
 // Zerobus writes metrics to a Databricks table.
@@ -48,21 +49,14 @@ type Zerobus struct {
 	ApplicationName string        `toml:"application_name"`
 	SchemaMode      string        `toml:"schema_mode"`
 
-	TimestampColumn    string          `toml:"timestamp_column"`
-	MeasurementColumn  string          `toml:"measurement_column"`
-	SchemaFetchTimeout config.Duration `toml:"schema_fetch_timeout"`
-	ConnectTimeout     config.Duration `toml:"connect_timeout"`
+	TimestampColumn   string          `toml:"timestamp_column"`
+	MeasurementColumn string          `toml:"measurement_column"`
+	ConnectTimeout    config.Duration `toml:"connect_timeout"`
 
-	ConcurrentStreams       int             `toml:"concurrent_streams"`
-	MaxInflight             int             `toml:"max_inflight"`
-	MaxBufferedPayloadBytes config.Size     `toml:"max_buffered_payload_bytes"`
-	MaxBatchRecords         int             `toml:"max_batch_records"`
-	MaxPayloadBytes         config.Size     `toml:"max_payload_bytes"`
-	RecoveryRetries         int             `toml:"recovery_retries"`
-	RecoveryTimeout         config.Duration `toml:"recovery_timeout"`
-	RecoveryBackoff         config.Duration `toml:"recovery_backoff"`
-	LackOfAckTimeout        config.Duration `toml:"lack_of_ack_timeout"`
-	FlushTimeout            config.Duration `toml:"flush_timeout"`
+	ConcurrentStreams int             `toml:"concurrent_streams"`
+	RecoveryRetries   int             `toml:"recovery_retries"`
+	LackOfAckTimeout  config.Duration `toml:"lack_of_ack_timeout"`
+	FlushTimeout      config.Duration `toml:"flush_timeout"`
 
 	Log telegraf.Logger `toml:"-"`
 
@@ -71,6 +65,10 @@ type Zerobus struct {
 	newSDK    sdkFactory
 	original  [][]byte
 	confirmed [][]byte
+
+	batchRecordLimit  int
+	payloadByteLimit  int
+	bufferedByteLimit int64
 
 	descriptorMu     sync.Mutex
 	descriptor       []byte
@@ -213,26 +211,8 @@ func (z *Zerobus) Init() error {
 	if z.ConcurrentStreams == 0 {
 		z.ConcurrentStreams = 1
 	}
-	if z.MaxInflight < 0 {
-		return errors.New(`option "max_inflight" cannot be negative`)
-	}
-	if z.MaxBufferedPayloadBytes < 0 {
-		return errors.New(`option "max_buffered_payload_bytes" cannot be negative`)
-	}
-	if z.MaxBatchRecords <= 0 {
-		return errors.New(`option "max_batch_records" must be greater than zero`)
-	}
-	if z.MaxPayloadBytes < 0 {
-		return errors.New(`option "max_payload_bytes" cannot be negative`)
-	}
-	if z.MaxPayloadBytes > 0 && z.MaxPayloadBytes <= batchEnvelopeReserve {
-		return fmt.Errorf(`option "max_payload_bytes" must exceed %d bytes`, batchEnvelopeReserve)
-	}
 	if z.RecoveryRetries < 0 {
 		return errors.New(`option "recovery_retries" cannot be negative`)
-	}
-	if z.SchemaFetchTimeout < 0 {
-		return errors.New(`option "schema_fetch_timeout" cannot be negative`)
 	}
 	if z.ConnectTimeout < 0 {
 		return errors.New(`option "connect_timeout" cannot be negative`)
@@ -240,19 +220,18 @@ func (z *Zerobus) Init() error {
 	if z.ConnectTimeout == 0 {
 		z.ConnectTimeout = config.Duration(defaultConnectTimeout)
 	}
-	for _, option := range []struct {
-		name  string
-		value config.Duration
-	}{
-		{"recovery_timeout", z.RecoveryTimeout},
-		{"recovery_backoff", z.RecoveryBackoff},
-		{"lack_of_ack_timeout", z.LackOfAckTimeout},
-		{"flush_timeout", z.FlushTimeout},
-	} {
-		if option.value < 0 {
-			return fmt.Errorf("option %q cannot be negative", option.name)
-		}
+	if z.LackOfAckTimeout < 0 {
+		return errors.New(`option "lack_of_ack_timeout" cannot be negative`)
 	}
+	if z.FlushTimeout < 0 {
+		return errors.New(`option "flush_timeout" cannot be negative`)
+	}
+
+	// Zerobus caps a request at 10 MiB and the SDK bounds what it allocates and buffers per stream,
+	// so these limits track the protocol rather than the agent's metric_batch_size
+	z.batchRecordLimit = defaultMaxBatchRecords
+	z.payloadByteLimit = defaultMaxPayloadBytes
+	z.bufferedByteLimit = defaultMaxBufferedPayloadBytes
 
 	// Setup the SDK constructor unless a test injected one
 	if z.newSDK == nil {
@@ -280,13 +259,7 @@ func (z *Zerobus) Connect() error {
 	if name := strings.TrimSpace(z.ApplicationName); name != "" {
 		applicationName += " " + name
 	}
-	sdkOptions := []sdkzerobus.Option{sdkzerobus.WithApplicationName(applicationName)}
-	if z.SchemaMode == schemaModeTableSchema {
-		if z.SchemaFetchTimeout > 0 {
-			sdkOptions = append(sdkOptions, sdkzerobus.WithProtoDescriptorFetchTimeout(time.Duration(z.SchemaFetchTimeout)))
-		}
-	}
-	sdk, err := z.newSDK(z.ServerEndpoint, z.WorkspaceURL, sdkOptions...)
+	sdk, err := z.newSDK(z.ServerEndpoint, z.WorkspaceURL, sdkzerobus.WithApplicationName(applicationName))
 	if err != nil {
 		return fmt.Errorf("creating Zerobus SDK failed: %w", err)
 	}
@@ -620,19 +593,11 @@ func (z *Zerobus) processPending(w *writer) error {
 }
 
 func (z *Zerobus) chunkRecords(records [][]byte) ([]recordBatch, error) {
-	maxBytes := int(z.MaxPayloadBytes)
-	if maxBytes <= 0 {
-		maxBytes = defaultMaxPayloadBytes
-	}
-	payloadBudget := maxBytes - batchEnvelopeReserve
-	if payloadBudget <= 0 {
-		return nil, fmt.Errorf("max_payload_bytes=%d is too small; it must exceed %d bytes", maxBytes, batchEnvelopeReserve)
-	}
-
-	chunks := make([]recordBatch, 0, (len(records)+z.MaxBatchRecords-1)/z.MaxBatchRecords)
+	payloadBudget := z.payloadByteLimit - batchEnvelopeReserve
+	chunks := make([]recordBatch, 0, (len(records)+z.batchRecordLimit-1)/z.batchRecordLimit)
 	for len(records) > 0 {
 		count, size := 0, 0
-		for count < len(records) && count < z.MaxBatchRecords {
+		for count < len(records) && count < z.batchRecordLimit {
 			recordSize := protowire.SizeTag(1) + protowire.SizeBytes(len(records[count]))
 			if err := z.validateRecordSize(recordSize, payloadBudget); err != nil {
 				return nil, fmt.Errorf("serialized metric %d cannot be admitted: %w", count, err)
@@ -640,7 +605,7 @@ func (z *Zerobus) chunkRecords(records [][]byte) ([]recordBatch, error) {
 			if size+recordSize > payloadBudget {
 				break
 			}
-			if z.MaxBufferedPayloadBytes > 0 && retainedPayloadSize(size+recordSize, count+1) > int64(z.MaxBufferedPayloadBytes) {
+			if retainedPayloadSize(size+recordSize, count+1) > z.bufferedByteLimit {
 				break
 			}
 			size += recordSize
@@ -657,11 +622,7 @@ func (z *Zerobus) prepareMetrics(metrics []telegraf.Metric) preparedWrite {
 		records: make([][]byte, 0, len(metrics)),
 		accept:  make([]int, 0, len(metrics)),
 	}
-	maxBytes := int(z.MaxPayloadBytes)
-	if maxBytes <= 0 {
-		maxBytes = defaultMaxPayloadBytes
-	}
-	payloadBudget := maxBytes - batchEnvelopeReserve
+	payloadBudget := z.payloadByteLimit - batchEnvelopeReserve
 
 	for i, metric := range metrics {
 		record, err := z.serializeMetric(metric)
@@ -696,11 +657,8 @@ func (z *Zerobus) validateRecordSize(recordSize, payloadBudget int) error {
 	if recordSize > payloadBudget {
 		return fmt.Errorf("requires %d bytes, exceeding the payload budget of %d bytes", recordSize, payloadBudget)
 	}
-	if z.MaxBufferedPayloadBytes > 0 {
-		retained := retainedPayloadSize(recordSize, 1)
-		if retained > int64(z.MaxBufferedPayloadBytes) {
-			return fmt.Errorf("requires approximately %d buffered bytes, exceeding max_buffered_payload_bytes=%d", retained, z.MaxBufferedPayloadBytes)
-		}
+	if retained := retainedPayloadSize(recordSize, 1); retained > z.bufferedByteLimit {
+		return fmt.Errorf("requires approximately %d buffered bytes, exceeding the buffer limit of %d bytes", retained, z.bufferedByteLimit)
 	}
 	return nil
 }
@@ -734,27 +692,15 @@ func recordsHavePrefix(records, prefix [][]byte) bool {
 }
 
 func (z *Zerobus) streamOptions() []sdkzerobus.StreamOption {
-	options := []sdkzerobus.StreamOption{sdkzerobus.WithWaitForReady()}
-	if z.MaxInflight > 0 {
-		options = append(options, sdkzerobus.WithMaxInflight(z.MaxInflight))
-	}
-	if z.MaxBufferedPayloadBytes > 0 {
-		options = append(options, sdkzerobus.WithMaxBufferedPayloadBytes(int64(z.MaxBufferedPayloadBytes)))
-	}
-	if z.MaxBatchRecords > 0 {
-		options = append(options, sdkzerobus.WithMaxBatchRecords(z.MaxBatchRecords))
-	}
-	if z.MaxPayloadBytes > 0 {
-		options = append(options, sdkzerobus.WithMaxPayloadBytes(int(z.MaxPayloadBytes)))
+	// Pin the limits the plugin chunks against so a stream cannot accept less than a prepared batch
+	options := []sdkzerobus.StreamOption{
+		sdkzerobus.WithWaitForReady(),
+		sdkzerobus.WithMaxBatchRecords(z.batchRecordLimit),
+		sdkzerobus.WithMaxPayloadBytes(z.payloadByteLimit),
+		sdkzerobus.WithMaxBufferedPayloadBytes(z.bufferedByteLimit),
 	}
 	if z.RecoveryRetries > 0 {
 		options = append(options, sdkzerobus.WithRecoveryRetries(z.RecoveryRetries))
-	}
-	if z.RecoveryTimeout > 0 {
-		options = append(options, sdkzerobus.WithRecoveryTimeout(time.Duration(z.RecoveryTimeout)))
-	}
-	if z.RecoveryBackoff > 0 {
-		options = append(options, sdkzerobus.WithRecoveryBackoff(time.Duration(z.RecoveryBackoff)))
 	}
 	if z.LackOfAckTimeout > 0 {
 		options = append(options, sdkzerobus.WithLackOfAckTimeout(time.Duration(z.LackOfAckTimeout)))
@@ -782,7 +728,6 @@ func init() {
 			TimestampColumn:   "timestamp",
 			ConnectTimeout:    config.Duration(defaultConnectTimeout),
 			ConcurrentStreams: 1,
-			MaxBatchRecords:   defaultMaxBatchRecords,
 		}
 	})
 }

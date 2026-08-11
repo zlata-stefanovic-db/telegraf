@@ -35,8 +35,18 @@ func TestDefaults(t *testing.T) {
 	require.Equal(t, "timestamp", plugin.TimestampColumn)
 	require.Equal(t, config.Duration(defaultConnectTimeout), plugin.ConnectTimeout)
 	require.Equal(t, 1, plugin.ConcurrentStreams)
-	require.Equal(t, defaultMaxBatchRecords, plugin.MaxBatchRecords)
 	require.NotEmpty(t, plugin.SampleConfig())
+}
+
+func TestInitSetsProtocolLimits(t *testing.T) {
+	plugin := validPlugin()
+	plugin.batchRecordLimit = 0
+	plugin.payloadByteLimit = 0
+	plugin.bufferedByteLimit = 0
+	require.NoError(t, plugin.Init())
+	require.Equal(t, defaultMaxBatchRecords, plugin.batchRecordLimit)
+	require.Equal(t, defaultMaxPayloadBytes, plugin.payloadByteLimit)
+	require.EqualValues(t, defaultMaxBufferedPayloadBytes, plugin.bufferedByteLimit)
 }
 
 func TestInitRequiredOptions(t *testing.T) {
@@ -98,44 +108,9 @@ func TestInitRejectsInvalidTuning(t *testing.T) {
 			option: "concurrent_streams",
 		},
 		{
-			name:   "negative max inflight",
-			mutate: func(z *Zerobus) { z.MaxInflight = -1 },
-			option: "max_inflight",
-		},
-		{
-			name:   "negative buffered bytes",
-			mutate: func(z *Zerobus) { z.MaxBufferedPayloadBytes = -1 },
-			option: "max_buffered_payload_bytes",
-		},
-		{
-			name:   "zero batch records",
-			mutate: func(z *Zerobus) { z.MaxBatchRecords = 0 },
-			option: "max_batch_records",
-		},
-		{
-			name:   "negative payload bytes",
-			mutate: func(z *Zerobus) { z.MaxPayloadBytes = -1 },
-			option: "max_payload_bytes",
-		},
-		{
-			name:   "payload bytes without envelope room",
-			mutate: func(z *Zerobus) { z.MaxPayloadBytes = batchEnvelopeReserve },
-			option: "max_payload_bytes",
-		},
-		{
 			name:   "negative recovery retries",
 			mutate: func(z *Zerobus) { z.RecoveryRetries = -1 },
 			option: "recovery_retries",
-		},
-		{
-			name:   "negative recovery timeout",
-			mutate: func(z *Zerobus) { z.RecoveryTimeout = -1 },
-			option: "recovery_timeout",
-		},
-		{
-			name:   "negative recovery backoff",
-			mutate: func(z *Zerobus) { z.RecoveryBackoff = -1 },
-			option: "recovery_backoff",
 		},
 		{
 			name:   "negative ack timeout",
@@ -146,11 +121,6 @@ func TestInitRejectsInvalidTuning(t *testing.T) {
 			name:   "negative flush timeout",
 			mutate: func(z *Zerobus) { z.FlushTimeout = -1 },
 			option: "flush_timeout",
-		},
-		{
-			name:   "negative schema fetch timeout",
-			mutate: func(z *Zerobus) { z.SchemaFetchTimeout = -1 },
-			option: "schema_fetch_timeout",
 		},
 		{
 			name:   "negative connect timeout",
@@ -422,13 +392,7 @@ func TestConnectPassesConfiguration(t *testing.T) {
 	sdk := &fakeSDK{stream: stream}
 	plugin := validPlugin()
 	plugin.ApplicationName = "telegraf-test"
-	plugin.MaxInflight = 12
-	plugin.MaxBufferedPayloadBytes = 1_024
-	plugin.MaxBatchRecords = 123
-	plugin.MaxPayloadBytes = 2_048
 	plugin.RecoveryRetries = 3
-	plugin.RecoveryTimeout = config.Duration(time.Second)
-	plugin.RecoveryBackoff = config.Duration(2 * time.Second)
 	plugin.LackOfAckTimeout = config.Duration(3 * time.Second)
 	plugin.FlushTimeout = config.Duration(4 * time.Second)
 
@@ -449,7 +413,7 @@ func TestConnectPassesConfiguration(t *testing.T) {
 	require.Equal(t, plugin.TableName, sdk.tableName)
 	require.Equal(t, plugin.ClientID, sdk.clientID)
 	require.Equal(t, "secret", sdk.clientSecret)
-	require.Len(t, sdk.options, 11)
+	require.Len(t, sdk.options, 8)
 	require.Len(t, sdk.contexts, 1)
 	_, hasDeadline := sdk.contexts[0].Deadline()
 	require.True(t, hasDeadline)
@@ -461,7 +425,6 @@ func TestConnectCreatesTableSchemaStream(t *testing.T) {
 	sdk := &fakeSDK{stream: stream}
 	plugin := validPlugin()
 	plugin.SchemaMode = schemaModeTableSchema
-	plugin.SchemaFetchTimeout = config.Duration(5 * time.Second)
 
 	var sdkOptionCount int
 	plugin.newSDK = func(_ string, _ string, options ...sdkzerobus.Option) (sdkClient, error) {
@@ -471,11 +434,11 @@ func TestConnectCreatesTableSchemaStream(t *testing.T) {
 
 	require.NoError(t, plugin.Init())
 	require.NoError(t, plugin.Connect())
-	require.Equal(t, 2, sdkOptionCount)
+	require.Equal(t, 1, sdkOptionCount)
 	require.Zero(t, sdk.staticSchemaCalls)
 	require.Equal(t, 1, sdk.tableSchemaCalls)
 	require.Equal(t, 1, sdk.fetchCalls)
-	require.Len(t, sdk.options, 3)
+	require.Len(t, sdk.options, 5)
 	require.Equal(t, []byte("descriptor"), plugin.descriptor)
 	require.Same(t, stream, currentStream(plugin))
 }
@@ -586,7 +549,7 @@ func TestWriteFailures(t *testing.T) {
 	t.Run("batch is split by record count", func(t *testing.T) {
 		stream := &fakeStream{}
 		plugin := validPlugin()
-		plugin.MaxBatchRecords = 1
+		plugin.batchRecordLimit = 1
 		setStream(plugin, stream)
 		input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
 		require.NoError(t, plugin.Write(input))
@@ -733,7 +696,7 @@ func TestWriteResumesAfterPartialChunkAdmission(t *testing.T) {
 	admissionErr := errors.New("temporary admission failure")
 	stream := &fakeStream{ingestErrors: []error{nil, admissionErr, nil}}
 	plugin := validPlugin()
-	plugin.MaxBatchRecords = 1
+	plugin.batchRecordLimit = 1
 	setStream(plugin, stream)
 	input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
 
@@ -1152,7 +1115,7 @@ func TestWriteTableSchemaReplaysOnlyUnacknowledgedChunk(t *testing.T) {
 	sdk := &fakeSDK{stream: replacement}
 	plugin := validPlugin()
 	plugin.SchemaMode = schemaModeTableSchema
-	plugin.MaxBatchRecords = 1
+	plugin.batchRecordLimit = 1
 	plugin.sdk = sdk
 	setStream(plugin, closed)
 	input := []telegraf.Metric{testutil.TestMetric(1), testutil.TestMetric(2)}
@@ -1171,7 +1134,7 @@ func TestWriteTableSchemaReplaysOnlyUnacknowledgedChunk(t *testing.T) {
 func TestWriteRejectsIndividuallyOversizedMetricBeforeAdmission(t *testing.T) {
 	stream := &fakeStream{}
 	plugin := validPlugin()
-	plugin.MaxPayloadBytes = batchEnvelopeReserve + 1
+	plugin.payloadByteLimit = batchEnvelopeReserve + 1
 	setStream(plugin, stream)
 
 	err := plugin.Write([]telegraf.Metric{testutil.TestMetric(1)})
@@ -1211,14 +1174,14 @@ func TestWriteRejectsMetricExceedingBufferedPayloadLimit(t *testing.T) {
 
 	stream := &fakeStream{}
 	plugin := validPlugin()
-	plugin.MaxBufferedPayloadBytes = config.Size(retainedPayloadSize(recordSize, 1) - 1)
+	plugin.bufferedByteLimit = retainedPayloadSize(recordSize, 1) - 1
 	setStream(plugin, stream)
 
 	err = plugin.Write([]telegraf.Metric{testutil.TestMetric(1)})
 	var writeErr *internal.PartialWriteError
 	require.ErrorAs(t, err, &writeErr)
 	require.Equal(t, []int{0}, writeErr.MetricsReject)
-	require.ErrorContains(t, err, "max_buffered_payload_bytes")
+	require.ErrorContains(t, err, "exceeding the buffer limit")
 	require.Zero(t, stream.ingestCalls)
 }
 
@@ -1229,9 +1192,7 @@ func TestWriteSplitsBatchByPayloadSize(t *testing.T) {
 
 	stream := &fakeStream{}
 	plugin := validPlugin()
-	plugin.MaxPayloadBytes = config.Size(
-		batchEnvelopeReserve + protowire.SizeTag(1) + protowire.SizeBytes(len(first)),
-	)
+	plugin.payloadByteLimit = batchEnvelopeReserve + protowire.SizeTag(1) + protowire.SizeBytes(len(first))
 	setStream(plugin, stream)
 
 	require.NoError(t, plugin.Write(input))
@@ -1253,10 +1214,7 @@ func TestWriteSplitsBatchByBufferedPayloadSize(t *testing.T) {
 
 	stream := &fakeStream{}
 	plugin := validPlugin()
-	plugin.MaxBufferedPayloadBytes = config.Size(max(
-		retainedPayloadSize(firstSize, 1),
-		retainedPayloadSize(secondSize, 1),
-	))
+	plugin.bufferedByteLimit = max(retainedPayloadSize(firstSize, 1), retainedPayloadSize(secondSize, 1))
 	setStream(plugin, stream)
 
 	require.NoError(t, plugin.Write(input))
@@ -1298,8 +1256,11 @@ func validPlugin() *Zerobus {
 		TimestampColumn:   "timestamp",
 		ConnectTimeout:    config.Duration(defaultConnectTimeout),
 		ConcurrentStreams: 1,
-		MaxBatchRecords:   defaultMaxBatchRecords,
 		Log:               testutil.Logger{},
+
+		batchRecordLimit:  defaultMaxBatchRecords,
+		payloadByteLimit:  defaultMaxPayloadBytes,
+		bufferedByteLimit: defaultMaxBufferedPayloadBytes,
 	}
 }
 

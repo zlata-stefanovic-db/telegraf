@@ -1299,8 +1299,10 @@ func validPlugin() *Zerobus {
 		ConnectTimeout:    config.Duration(defaultConnectTimeout),
 		ConcurrentStreams: 1,
 		MaxBatchRecords:   defaultMaxBatchRecords,
+		Log:               testutil.Logger{},
 	}
 }
+
 func setStream(plugin *Zerobus, stream ingestStream) {
 	plugin.writers = []*writer{{stream: stream}}
 }

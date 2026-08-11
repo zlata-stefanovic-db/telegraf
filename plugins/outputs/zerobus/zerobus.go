@@ -64,6 +64,8 @@ type Zerobus struct {
 	LackOfAckTimeout        config.Duration `toml:"lack_of_ack_timeout"`
 	FlushTimeout            config.Duration `toml:"flush_timeout"`
 
+	Log telegraf.Logger `toml:"-"`
+
 	sdk       sdkClient
 	writers   []*writer
 	newSDK    sdkFactory
@@ -169,6 +171,7 @@ func (*Zerobus) SampleConfig() string {
 
 // Init the output plugin.
 func (z *Zerobus) Init() error {
+	// Normalize the settings
 	z.SchemaMode = strings.ToLower(strings.TrimSpace(z.SchemaMode))
 	z.TimestampColumn = strings.TrimSpace(z.TimestampColumn)
 	z.MeasurementColumn = strings.TrimSpace(z.MeasurementColumn)
@@ -181,6 +184,7 @@ func (z *Zerobus) Init() error {
 	if z.SchemaMode == schemaModeTableSchema && z.MeasurementColumn != "" && z.MeasurementColumn == z.TimestampColumn {
 		return errors.New(`options "measurement_column" and "timestamp_column" must be different`)
 	}
+	// Check the required settings
 	requiredStrings := []struct {
 		name  string
 		value string
@@ -199,6 +203,7 @@ func (z *Zerobus) Init() error {
 		return errors.New(`option "client_secret" must be set`)
 	}
 
+	// Check the streaming and recovery tuning settings
 	if z.ConcurrentStreams < 0 {
 		return errors.New(`option "concurrent_streams" cannot be negative`)
 	}
@@ -249,6 +254,7 @@ func (z *Zerobus) Init() error {
 		}
 	}
 
+	// Setup the SDK constructor unless a test injected one
 	if z.newSDK == nil {
 		z.newSDK = func(serverEndpoint, workspaceURL string, opts ...sdkzerobus.Option) (sdkClient, error) {
 			sdk, err := sdkzerobus.New(serverEndpoint, workspaceURL, opts...)
@@ -269,6 +275,7 @@ func (z *Zerobus) Connect() error {
 	}
 	defer secret.Destroy()
 
+	// Setup the SDK client
 	applicationName := internal.ProductToken()
 	if name := strings.TrimSpace(z.ApplicationName); name != "" {
 		applicationName += " " + name
@@ -287,7 +294,7 @@ func (z *Zerobus) Connect() error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(z.ConnectTimeout))
 	defer cancel()
-	// The first stream fetches the table schema descriptor and the rest reuse it.
+	// Open the streams; the first one fetches the table schema descriptor and the rest reuse it
 	writers := make([]*writer, 0, z.ConcurrentStreams)
 	for range z.ConcurrentStreams {
 		w := &writer{}
@@ -304,6 +311,7 @@ func (z *Zerobus) Connect() error {
 		writers = append(writers, w)
 	}
 	z.writers = writers
+	z.Log.Debugf("Opened %d stream(s) to table %q in %s schema mode", len(writers), z.TableName, z.SchemaMode)
 
 	return nil
 }
@@ -327,6 +335,7 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 		z.original = nil
 	}
 
+	// Serialize the metrics, rejecting the ones that cannot be encoded or do not fit the budgets
 	prepared := z.prepareMetrics(metrics)
 	records := prepared.records
 	if len(records) == 0 {
@@ -338,6 +347,7 @@ func (z *Zerobus) Write(metrics []telegraf.Metric) error {
 	// Telegraf retries the whole batch, so drop the leading records a previous attempt already acknowledged.
 	if z.confirmed != nil {
 		if recordsHavePrefix(records, z.confirmed) {
+			z.Log.Debugf("Skipping %d record(s) acknowledged by the previous attempt", len(z.confirmed))
 			records = records[len(z.confirmed):]
 			if len(records) == 0 {
 				z.confirmed = nil
@@ -506,6 +516,7 @@ func (z *Zerobus) recreateStream(w *writer) error {
 	if err != nil {
 		return z.writeError("retrieving unacknowledged batches", err)
 	}
+	z.Log.Warnf("Stream is closed, recreating it and replaying %d unacknowledged batch(es)", len(unacked))
 	_ = w.stream.Close()
 	w.stream = nil
 	// Table-schema records replay as JSON, because the new stream may encode them against a newer descriptor.
@@ -540,6 +551,7 @@ func (z *Zerobus) ageDescriptor() {
 	switch {
 	case z.descriptor == nil:
 	case z.descriptorReused:
+		z.Log.Debug("Discarding the cached table schema descriptor, the next stream will refetch it")
 		z.descriptor = nil
 		z.descriptorReused = false
 	default:
